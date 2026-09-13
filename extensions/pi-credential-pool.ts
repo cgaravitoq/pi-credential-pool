@@ -1,7 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createAssistantMessageEventStream, type Api, type AssistantMessageEvent, type AssistantMessageEventStream, type Context, type Model, type ModelsStoreEntry, type SimpleStreamOptions } from "@earendil-works/pi-ai";
-import { getBuiltinModelDataGeneratedAt } from "@earendil-works/pi-ai/providers/all";
-import { opencodeGoProvider } from "@earendil-works/pi-ai/providers/opencode-go";
+import { createAssistantMessageEventStream, type Api, type AssistantMessageEvent, type AssistantMessageEventStream, type Context, type Model, type ModelsStoreEntry, type Provider, type SimpleStreamOptions } from "@earendil-works/pi-ai";
+import { builtinProviders, getBuiltinModelDataGeneratedAt } from "@earendil-works/pi-ai/providers/all";
 import { attemptOutcome, credentialIdentity, CredentialPool, retryAfterMs, type CredentialEntry, type Failure } from "../src/pool.ts";
 import { defaultStorePath, readPools, SerializedPools } from "../src/storage.ts";
 import { fetchUsage, UsageCache, type FetchLike, type UsageReport } from "../src/usage.ts";
@@ -89,7 +88,7 @@ export function createPooledStream(pool: CredentialPool, sessionId: () => string
 }
 
 type GoApi = "anthropic-messages" | "openai-completions" | "openai-responses";
-type GoProvider = ReturnType<typeof opencodeGoProvider>;
+type GoProvider = Provider<GoApi>;
 
 function mergeCatalog<T extends Api>(base: readonly Model<T>[], overlay: readonly Model<T>[]): readonly Model<T>[] {
 	const merged = [...base];
@@ -132,7 +131,8 @@ export default async function credentialPoolExtension(pi: ExtensionAPI, deps: Po
 	const path = defaultStorePath();
 	const stored = await readPools(path);
 	const pool = new CredentialPool(stored.pools[poolName] ?? []);
-	const builtin = opencodeGoProvider();
+	const builtin = builtinProviders().find((provider) => provider.id === poolName) as GoProvider | undefined;
+	if (!builtin) throw new Error("OpenCode Go provider is unavailable");
 	const catalog: { current: GoProvider } = { current: builtin };
 	const restoredCatalog: { models: readonly Model<GoApi>[] } = { models: [] };
 	const builtinGeneratedAt = getBuiltinModelDataGeneratedAt();

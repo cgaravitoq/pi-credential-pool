@@ -1,6 +1,6 @@
 {
   "name": "pi-credential-pool",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Multi-account OpenCode Go credential pool for Pi",
   "type": "module",
   "license": "MIT",
