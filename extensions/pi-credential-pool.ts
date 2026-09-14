@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createAssistantMessageEventStream, type Api, type AssistantMessageEvent, type AssistantMessageEventStream, type Context, type Model, type ModelsStoreEntry, type Provider, type SimpleStreamOptions } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, type Api, type AssistantMessageEvent, type AssistantMessageEventStream, type Model, type ModelsStoreEntry, type Provider } from "@earendil-works/pi-ai";
 import { builtinProviders, getBuiltinModelDataGeneratedAt } from "@earendil-works/pi-ai/providers/all";
 import { attemptOutcome, credentialIdentity, CredentialPool, retryAfterMs, type CredentialEntry, type Failure } from "../src/pool.ts";
 import { defaultStorePath, readPools, SerializedPools } from "../src/storage.ts";
@@ -9,6 +9,9 @@ const poolName = "opencode-go";
 
 export type PoolExtensionDeps = { fetch?: FetchLike; now?: () => number };
 type ProviderStream = (key: string, fetch: typeof globalThis.fetch) => AssistantMessageEventStream;
+type StreamMetadata = { status?: number; retryAfterMs?: number };
+type CatalogRef = { current: GoProvider };
+type RestoredModelRef = { models: readonly Model<GoApi>[] };
 
 function isVisible(event: AssistantMessageEvent): boolean {
 	return event.type === "text_start" || event.type === "text_delta" || event.type === "thinking_start" || event.type === "thinking_delta" || event.type === "toolcall_start" || event.type === "toolcall_delta";
@@ -19,7 +22,7 @@ function statusFrom(message: string): number | undefined {
 	return match ? Number(match[1]) : undefined;
 }
 
-function failureFrom(response: { status?: number; retryAfterMs?: number }, message = ""): Failure {
+function failureFrom(response: StreamMetadata, message = ""): Failure {
 	return { status: response.status ?? statusFrom(message), retryAfterMs: response.retryAfterMs, quota: /quota|rate limit/i.test(message) };
 }
 
@@ -39,7 +42,7 @@ export function createPooledStream(pool: CredentialPool, sessionId: () => string
 			attempted.add(credential.identity);
 			pool.markAttempt(credential, at);
 			let visible = false;
-			let response: { status?: number; retryAfterMs?: number } = {};
+			let response: StreamMetadata = {};
 			const trackedFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 				const result = await fetcher(input, init);
 				response = { status: result.status, retryAfterMs: retryAfterMs(result.headers.get("retry-after")) };
@@ -133,8 +136,8 @@ export default async function credentialPoolExtension(pi: ExtensionAPI, deps: Po
 	const pool = new CredentialPool(stored.pools[poolName] ?? []);
 	const builtin = builtinProviders().find((provider) => provider.id === poolName) as GoProvider | undefined;
 	if (!builtin) throw new Error("OpenCode Go provider is unavailable");
-	const catalog: { current: GoProvider } = { current: builtin };
-	const restoredCatalog: { models: readonly Model<GoApi>[] } = { models: [] };
+	const catalog: CatalogRef = { current: builtin };
+	const restoredCatalog: RestoredModelRef = { models: [] };
 	const builtinGeneratedAt = getBuiltinModelDataGeneratedAt();
 	const mutations = new SerializedPools();
 	const usageCache = new UsageCache();

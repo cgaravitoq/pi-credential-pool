@@ -51,15 +51,12 @@ async function acquireMutationLock(path: string): Promise<() => Promise<void>> {
           continue;
         }
 
+        if (await readFile(recoveryPath, "utf8") !== recovery) continue;
+        await rm(ownerPath, { force: true });
         try {
-          if (await readFile(recoveryPath, "utf8") !== recovery) continue;
-          await rm(ownerPath, { force: true });
-        } finally {
-          try {
-            if (await readFile(recoveryPath, "utf8") === recovery) await rm(recoveryPath, { force: true });
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-          }
+          if (await readFile(recoveryPath, "utf8") === recovery) await rm(recoveryPath, { force: true });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
         try {
           await rmdir(lockPath);

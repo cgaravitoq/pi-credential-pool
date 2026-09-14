@@ -37,12 +37,13 @@ async function harness(options: { keys?: string[]; now?: () => number; respond: 
     return options.respond(authorization.replace(/^Bearer /, ""));
   };
   let command: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
+  const extension = {
+    on: () => undefined,
+    registerProvider: () => undefined,
+    registerCommand: (_name: string, value: unknown) => { command = value as typeof command; },
+  } as Partial<ExtensionAPI>;
   try {
-    await credentialPoolExtension({
-      on: () => undefined,
-      registerProvider: () => undefined,
-      registerCommand: (_name: string, value: unknown) => { command = value as typeof command; },
-    } as unknown as ExtensionAPI, { fetch: fetcher, now: options.now });
+    await credentialPoolExtension(extension as ExtensionAPI, { fetch: fetcher, now: options.now });
   } finally {
     if (previousHome === undefined) delete process.env.HOME;
     else process.env.HOME = previousHome;
@@ -225,15 +226,15 @@ describe("provider catalog", () => {
     const previousHome = process.env.HOME;
     process.env.HOME = home;
     await writePools({ version: 1, pools: { "opencode-go": ["catalog-key"] } }, join(home, ".pi", "agent", "credential-pools.json"));
-    const handlers: Array<(event: unknown, ctx: unknown) => Promise<void>> = [];
+    const handlers: Array<(event: unknown, ctx: unknown) => void> = [];
     const pi = {
-      on: (_name: string, handler: (event: unknown, ctx: unknown) => Promise<void>) => handlers.push(handler),
-      registerProvider: (provider: Provider) => registry.registerProvider(provider),
+      on: (_name: string, handler: (event: unknown, ctx: unknown) => void) => handlers.push(handler),
+      registerProvider: (provider: unknown) => registry.registerProvider(provider as Provider),
       unregisterProvider: (name: string) => registry.unregisterProvider(name),
       registerCommand: () => undefined,
-    } as unknown as ExtensionAPI;
+    } as Partial<ExtensionAPI>;
     try {
-      await credentialPoolExtension(pi, { fetch: async () => json(usageBody(1, 2, 3)) });
+      await credentialPoolExtension(pi as ExtensionAPI, { fetch: async () => json(usageBody(1, 2, 3)) });
       await runtime.refresh({ allowNetwork: false });
       expect(registry.find("opencode-go", "deepseek-refreshed")).toBeDefined();
       for (const handler of handlers) await handler({ type: "session_start", reason: "startup" }, { sessionManager: { getSessionId: () => "session" }, modelRegistry: registry });
@@ -260,12 +261,12 @@ describe("provider catalog", () => {
     const registered: Provider[] = [];
     const pi = {
       on: (_name: string, handler: (event: unknown, ctx: unknown) => void) => handlers.push(handler),
-      registerProvider: (provider: Provider) => registered.push(provider),
+      registerProvider: (provider: unknown) => registered.push(provider as Provider),
       unregisterProvider: () => undefined,
       registerCommand: () => undefined,
-    } as unknown as ExtensionAPI;
+    } as Partial<ExtensionAPI>;
     try {
-      await credentialPoolExtension(pi, { fetch: async () => json(usageBody(1, 2, 3)) });
+      await credentialPoolExtension(pi as ExtensionAPI, { fetch: async () => json(usageBody(1, 2, 3)) });
       expect(registered[0]!.getModels().some((model) => model.id === "someone-elses-refresh")).toBe(false);
       for (const handler of handlers) handler({ type: "session_start", reason: "startup" }, { sessionManager: { getSessionId: () => "session" }, modelRegistry: { getProvider: () => live } });
       const wrapped = registered.at(-1)!;

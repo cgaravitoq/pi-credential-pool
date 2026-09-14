@@ -12,11 +12,17 @@
   "bugs": "https://github.com/cgaravitoq/pi-credential-pool/issues",
   "keywords": ["pi-package", "pi", "opencode", "opencode-go", "credentials"],
   "files": ["extensions", "scripts", "src", "README.md", "LICENSE"],
-  "pi": { "extensions": ["./extensions/pi-credential-pool.ts"] },
-  "publishConfig": { "access": "public", "provenance": true },
+  "pi": {
+    "extensions": ["./extensions/pi-credential-pool.ts"]
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "scripts": {
     "check": "tsc --noEmit",
     "check:package": "npm pack --dry-run --json",
+    "lint:slop": "oxlint -c oxlint.config.mts --deny-warnings",
     "test": "bun test",
     "smoke:opencode-go": "bun run scripts/live-smoke.ts"
   },
@@ -28,6 +34,8 @@
     "@earendil-works/pi-ai": "0.85.1",
     "@earendil-works/pi-coding-agent": "0.85.1",
     "@types/bun": "^1.3.0",
-    "typescript": "^5.9.3"
+    "oxlint": "1.82.0",
+    "typescript": "^5.9.3",
+    "ultracite": "7.11.1"
   }
 }
