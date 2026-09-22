@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, stat, utimes } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -134,47 +134,215 @@ test("serializes mutations from independent pools", async () => {
   expect(await readPools(path)).toEqual({ version: 1, pools: { first: ["first"], second: ["second"] } });
 });
 
-test("preserves a replacement lock when a stale owner releases late", async () => {
+test("leaves a replacement lock alone when a superseded owner releases late", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-credential-pool-"));
   const path = join(directory, "credential-pools.json");
-  const firstPool = new SerializedPools();
-  const secondPool = new SerializedPools();
-  const thirdPool = new SerializedPools();
+  const lockPath = `${path}.lock`;
   let startFirst!: () => void;
   let releaseFirst!: () => void;
-  let releaseSecond!: () => void;
-  let startSecond!: () => void;
-  let startThird!: () => void;
-  const firstReleased = new Promise<void>((resolve) => { releaseFirst = resolve; });
-  const secondReleased = new Promise<void>((resolve) => { releaseSecond = resolve; });
   const firstStarted = new Promise<void>((resolve) => { startFirst = resolve; });
-  const secondStarted = new Promise<void>((resolve) => { startSecond = resolve; });
-  const thirdStarted = new Promise<void>((resolve) => { startThird = resolve; });
+  const firstReleased = new Promise<void>((resolve) => { releaseFirst = resolve; });
 
-  const first = firstPool.mutate(path, async () => {
+  const first = new SerializedPools().mutate(path, async (pools) => {
     startFirst();
     await firstReleased;
+    pools.pools.first = ["first"];
   });
   await firstStarted;
-  const stale = new Date(Date.now() - 31_000);
-  await utimes(`${path}.lock`, stale, stale);
-  const second = secondPool.mutate(path, async (pools) => {
-    startSecond();
-    await secondReleased;
-    pools.pools.second = ["second"];
-  });
-  await secondStarted;
+  await rm(lockPath, { recursive: true, force: true });
+  await mkdir(lockPath, { mode: 0o700 });
+  await writeFile(join(lockPath, "owner"), "replacement", { mode: 0o600 });
   releaseFirst();
-  await first;
-  const third = thirdPool.mutate(path, (pools) => {
-    startThird();
-    pools.pools.third = ["third"];
-  });
+  await expect(first).rejects.toThrow("Lost the credential pool storage lock");
 
-  expect(await Promise.race([thirdStarted.then(() => true), Bun.sleep(25).then(() => false)])).toBe(false);
-  releaseSecond();
-  await Promise.all([second, third]);
-  expect(await readPools(path)).toEqual({ version: 1, pools: { second: ["second"], third: ["third"] } });
+  expect(await readFile(join(lockPath, "owner"), "utf8")).toBe("replacement");
+  expect(await readPools(path)).toEqual({ version: 1, pools: {} });
+  await rm(lockPath, { recursive: true, force: true });
+});
+
+test("fails the late write of a frozen holder whose lock was taken over", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-credential-pool-"));
+  const path = join(directory, "credential-pools.json");
+  const lockPath = `${path}.lock`;
+  const readyPath = join(directory, "held");
+  const storage = join(import.meta.dir, "../src/storage.ts");
+  const holder = Bun.spawn(["bun", "-e", `import { SerializedPools } from ${JSON.stringify(storage)};\nawait new SerializedPools().mutate(${JSON.stringify(path)}, async (pools) => { pools.pools.holder = ["holder"]; await Bun.write(${JSON.stringify(readyPath)}, "ready"); await Bun.sleep(500); });`], { stdout: "ignore", stderr: "pipe" });
+  while (!await Bun.file(readyPath).exists()) await Bun.sleep(10);
+
+  process.kill(holder.pid, "SIGSTOP");
+  const frozen = new Date(Date.now() - 31_000);
+  await utimes(join(lockPath, "owner"), frozen, frozen);
+  await utimes(lockPath, frozen, frozen);
+  await new SerializedPools().mutate(path, (pools) => { pools.pools.waiter = ["waiter"]; });
+  process.kill(holder.pid, "SIGCONT");
+
+  const code = await holder.exited;
+  const stderr = await new Response(holder.stderr).text();
+  expect(code).not.toBe(0);
+  expect(stderr).toContain("Lost the credential pool storage lock");
+  expect(await readPools(path)).toEqual({ version: 1, pools: { waiter: ["waiter"] } });
+}, 20_000);
+
+test("never detaches the lock a waiter can grab while an owner is inside its critical section", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-credential-pool-"));
+  const path = join(directory, "credential-pools.json");
+  const lockName = "credential-pools.json.lock";
+  const lockPath = join(directory, lockName);
+  const pools = new SerializedPools();
+  let held = false;
+  let collisions = 0;
+  let sampling = true;
+
+  const sample = async () => {
+    while (sampling) {
+      try {
+        await mkdir(lockPath, { mode: 0o700 });
+      } catch {
+        await Bun.sleep(0);
+        continue;
+      }
+      const stray = (await readdir(directory)).filter((entry) => entry.startsWith(lockName) && entry !== lockName);
+      if (held && stray.length > 0) collisions += 1;
+      await rm(lockPath, { recursive: true, force: true });
+      await Bun.sleep(0);
+    }
+  };
+  const samplers = Array.from({ length: 5 }, () => sample());
+
+  for (let iteration = 0; iteration < 200; iteration += 1) {
+    await pools.mutate(path, (stored) => {
+      held = true;
+      stored.pools.keys = [`key-${iteration}`];
+    });
+    held = false;
+  }
+  sampling = false;
+  await Promise.all(samplers);
+
+  expect(collisions).toBe(0);
+  expect(await readdir(directory)).toEqual(["credential-pools.json"]);
+  expect(await readPools(path)).toEqual({ version: 1, pools: { keys: ["key-199"] } });
+}, 60_000);
+
+test("waits for a paused live holder instead of taking its lock over", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-credential-pool-"));
+  const path = join(directory, "credential-pools.json");
+  const lockPath = `${path}.lock`;
+  let startHolder!: () => void;
+  let releaseHolder!: () => void;
+  const holderStarted = new Promise<void>((resolve) => { startHolder = resolve; });
+  const holderReleased = new Promise<void>((resolve) => { releaseHolder = resolve; });
+
+  const holder = new SerializedPools().mutate(path, async (pools) => {
+    startHolder();
+    await holderReleased;
+    pools.pools.holder = ["holder"];
+  });
+  await holderStarted;
+  const paused = new Date(Date.now() - 31_000);
+  await utimes(join(lockPath, "owner"), paused, paused);
+  await utimes(lockPath, paused, paused);
+
+  let entered = false;
+  const waiter = new SerializedPools().mutate(path, (pools) => {
+    entered = true;
+    pools.pools.waiter = ["waiter"];
+  });
+  await Bun.sleep(3_000);
+  expect(entered).toBe(false);
+
+  releaseHolder();
+  await Promise.all([holder, waiter]);
+  expect(await readPools(path)).toEqual({ version: 1, pools: { holder: ["holder"], waiter: ["waiter"] } });
+}, 20_000);
+
+test("recovers an ownerless lock a crashed holder left behind", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-credential-pool-"));
+  const path = join(directory, "credential-pools.json");
+  const lockPath = `${path}.lock`;
+  await mkdir(lockPath, { mode: 0o700 });
+  const crashed = new Date(Date.now() - 31_000);
+  await utimes(lockPath, crashed, crashed);
+
+  await new SerializedPools().mutate(path, (pools) => { pools.pools.recovered = ["key"]; });
+  expect(await readPools(path)).toEqual({ version: 1, pools: { recovered: ["key"] } });
+}, 15_000);
+
+test("waits out a holder that fell silent instead of timing out", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-credential-pool-"));
+  const path = join(directory, "credential-pools.json");
+  const lockPath = `${path}.lock`;
+  await mkdir(lockPath, { mode: 0o700 });
+  await writeFile(join(lockPath, "owner"), "crashed", { mode: 0o600 });
+  const silent = new Date(Date.now() - 23_000);
+  await utimes(join(lockPath, "owner"), silent, silent);
+  await utimes(lockPath, silent, silent);
+
+  const started = Date.now();
+  await new SerializedPools().mutate(path, (pools) => { pools.pools.recovered = ["key"]; });
+
+  expect(Date.now() - started).toBeGreaterThan(5_000);
+  expect(await readPools(path)).toEqual({ version: 1, pools: { recovered: ["key"] } });
+}, 30_000);
+
+test("paces the waiting recoverer instead of spinning on one core", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-credential-pool-"));
+  const path = join(directory, "credential-pools.json");
+  const lockPath = `${path}.lock`;
+  const recoveryPath = join(lockPath, "recovery");
+  await mkdir(lockPath, { mode: 0o700 });
+  await writeFile(join(lockPath, "owner"), "abandoned", { mode: 0o600 });
+  await writeFile(recoveryPath, "other", { mode: 0o600 });
+  const stale = new Date(Date.now() - 31_000);
+  await utimes(join(lockPath, "owner"), stale, stale);
+  await utimes(lockPath, stale, stale);
+
+  const before = process.cpuUsage();
+  const mutation = new SerializedPools().mutate(path, (pools) => { pools.pools.recovered = ["key"]; });
+  await Bun.sleep(500);
+  const spent = process.cpuUsage(before);
+  await rm(lockPath, { recursive: true, force: true });
+  await mutation;
+
+  expect(spent.user + spent.system).toBeLessThan(300_000);
+  expect(await readPools(path)).toEqual({ version: 1, pools: { recovered: ["key"] } });
+}, 15_000);
+
+test("completes a recovery whose claim a rival keeps deleting underneath it", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-credential-pool-"));
+  const path = join(directory, "credential-pools.json");
+  const lockPath = `${path}.lock`;
+  const recoveryPath = join(lockPath, "recovery");
+  const stale = new Date(Date.now() - 31_000);
+  await mkdir(lockPath, { mode: 0o700 });
+  await utimes(lockPath, stale, stale);
+
+  let clearing = true;
+  const rival = (async () => {
+    while (clearing) {
+      await rm(recoveryPath, { force: true });
+      await mkdir(lockPath, { mode: 0o700 }).catch(() => undefined);
+      await utimes(lockPath, stale, stale).catch(() => undefined);
+    }
+  })();
+  const outcome = new SerializedPools().mutate(path, (pools) => { pools.pools.recovered = ["key"]; }).then(() => "resolved", (error: Error) => error.message);
+  await Bun.sleep(750);
+  clearing = false;
+  await rival;
+
+  expect(await outcome).toBe("resolved");
+  expect(await readPools(path)).toEqual({ version: 1, pools: { recovered: ["key"] } });
+}, 15_000);
+
+test("serializes mutations across separate processes", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-credential-pool-"));
+  const path = join(directory, "credential-pools.json");
+  const storage = join(import.meta.dir, "../src/storage.ts");
+  const keys = Array.from({ length: 8 }, (_, index) => `key-${index}`);
+  const children = keys.map((key) => Bun.spawn(["bun", "-e", `import { SerializedPools } from ${JSON.stringify(storage)};\nawait new SerializedPools().mutate(${JSON.stringify(path)}, async (pools) => { pools.pools.keys = [...(pools.pools.keys ?? []), ${JSON.stringify(key)}]; await Bun.sleep(25); });`], { stdout: "ignore", stderr: "pipe" }));
+  const results = await Promise.all(children.map(async (child) => ({ code: await child.exited, stderr: await new Response(child.stderr).text() })));
+  expect(results.filter((result) => result.code !== 0)).toEqual([]);
+  expect((await readPools(path)).pools.keys?.slice().sort()).toEqual([...keys].sort());
 });
 
 test("smoke request sends Pi OpenCode headers with a unique session per credential", async () => {
