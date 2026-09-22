@@ -1,4 +1,4 @@
-import { chmod, mkdir, readFile, rename, rm, rmdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -9,13 +9,14 @@ const lockWaitMs = 5_000;
 const staleLockMs = 30_000;
 
 const sleep = (milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+const missing = (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT";
 
 async function acquireMutationLock(path: string): Promise<() => Promise<void>> {
   const lockPath = `${path}.lock`;
   const ownerPath = join(lockPath, "owner");
   const recoveryPath = join(lockPath, "recovery");
   const owner = randomUUID();
-  const deadline = Date.now() + lockWaitMs;
+  let deadline = Date.now() + lockWaitMs;
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
 
   while (true) {
@@ -23,50 +24,63 @@ async function acquireMutationLock(path: string): Promise<() => Promise<void>> {
       await mkdir(lockPath, { mode: 0o700 });
       await writeFile(ownerPath, owner, { encoding: "utf8", flag: "wx", mode: 0o600 });
       return async () => {
+        const releasing = `${lockPath}.release-${owner}`;
         try {
-          if (await readFile(ownerPath, "utf8") !== owner) return;
+          await rename(lockPath, releasing);
         } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+          if (missing(error)) return;
           throw error;
         }
-        await rm(ownerPath, { force: true });
+        let held: string | undefined;
         try {
-          await rmdir(lockPath);
+          held = await readFile(join(releasing, "owner"), "utf8");
         } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT" && (error as NodeJS.ErrnoException).code !== "ENOTEMPTY") throw error;
+          if (!missing(error)) throw error;
         }
+        if (held !== owner) {
+          await rename(releasing, lockPath);
+          return;
+        }
+        await rm(releasing, { recursive: true, force: true });
       };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
 
     try {
-      if (Date.now() - (await stat(lockPath)).mtimeMs > staleLockMs) {
+      const held = await stat(lockPath);
+      deadline = Math.max(deadline, held.mtimeMs + staleLockMs + 1_000);
+      if (Date.now() - held.mtimeMs > staleLockMs) {
         const recovery = randomUUID();
         try {
           await writeFile(recoveryPath, recovery, { encoding: "utf8", flag: "wx", mode: 0o600 });
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
           if (Date.now() - (await stat(recoveryPath)).mtimeMs > staleLockMs) await rm(recoveryPath, { force: true });
+          await sleep(10);
           continue;
         }
 
-        if (await readFile(recoveryPath, "utf8") !== recovery) continue;
+        if (await readFile(recoveryPath, "utf8") !== recovery) {
+          await sleep(10);
+          continue;
+        }
         await rm(ownerPath, { force: true });
         try {
           if (await readFile(recoveryPath, "utf8") === recovery) await rm(recoveryPath, { force: true });
         } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          if (!missing(error)) throw error;
         }
         try {
           await rmdir(lockPath);
         } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT" && (error as NodeJS.ErrnoException).code !== "ENOTEMPTY") throw error;
+          if (!missing(error) && (error as NodeJS.ErrnoException).code !== "ENOTEMPTY") throw error;
         }
+        await sleep(10);
         continue;
       }
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if (!missing(error)) throw error;
       continue;
     }
 
@@ -98,9 +112,7 @@ export async function writePools(value: StoredPools, path = defaultStorePath()):
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
   await writeFile(temporary, JSON.stringify(value), { mode: 0o600 });
-  await chmod(temporary, 0o600);
   await rename(temporary, path);
-  await chmod(path, 0o600);
 }
 
 export class SerializedPools {
