@@ -106,14 +106,19 @@ export class CredentialPool {
   }
 
   fail(item: Credential, failure: Failure, now = Date.now()): boolean {
+    const target = this.#items.find((candidate) => candidate.identity === item.identity);
     if (failure.status === 401 || failure.status === 403) {
-      item.health = "disabled";
-      delete item.retryAt;
+      if (target) {
+        target.health = "disabled";
+        delete target.retryAt;
+      }
       return true;
     }
     if (failure.status === 429 || failure.quota) {
-      item.health = "cooling";
-      item.retryAt = now + (failure.retryAfterMs ?? 60_000);
+      if (target) {
+        target.health = "cooling";
+        target.retryAt = now + (failure.retryAfterMs ?? 60_000);
+      }
       return true;
     }
     return false;
