@@ -54,6 +54,19 @@ describe("CredentialPool", () => {
     expect(pool.select(undefined, 1_010)?.key).toBe("one");
   });
 
+  test("carries a 429 cooldown by identity when a replacement reorders the keys", () => {
+    const pool = new CredentialPool(["one", "two"]);
+    const selected = pool.select()!;
+    pool.fail(selected, { status: 429, retryAfterMs: 1_000 }, 10);
+    pool.replace(["two", "one"]);
+    expect(pool.entries(11)).toMatchObject([
+      { fingerprint: fingerprint("two"), health: "ready" },
+      { fingerprint: fingerprint("one"), health: "cooling", retryAt: 1_010 },
+    ]);
+    expect(pool.select(undefined, 11)?.key).toBe("two");
+    expect(pool.entries(1_010).map((entry) => entry.health)).toEqual(["ready", "ready"]);
+  });
+
   test("cools a 429 without Retry-After for the default minute", () => {
     const pool = new CredentialPool(["one", "two"]);
     const selected = pool.select()!;
