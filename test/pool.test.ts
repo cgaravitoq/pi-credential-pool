@@ -308,6 +308,32 @@ test("paces the waiting recoverer instead of spinning on one core", async () => 
   expect(await readPools(path)).toEqual({ version: 1, pools: { recovered: ["key"] } });
 }, 15_000);
 
+test("completes a recovery whose claim a rival keeps deleting underneath it", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-credential-pool-"));
+  const path = join(directory, "credential-pools.json");
+  const lockPath = `${path}.lock`;
+  const recoveryPath = join(lockPath, "recovery");
+  const stale = new Date(Date.now() - 31_000);
+  await mkdir(lockPath, { mode: 0o700 });
+  await utimes(lockPath, stale, stale);
+
+  let clearing = true;
+  const rival = (async () => {
+    while (clearing) {
+      await rm(recoveryPath, { force: true });
+      await mkdir(lockPath, { mode: 0o700 }).catch(() => undefined);
+      await utimes(lockPath, stale, stale).catch(() => undefined);
+    }
+  })();
+  const outcome = new SerializedPools().mutate(path, (pools) => { pools.pools.recovered = ["key"]; }).then(() => "resolved", (error: Error) => error.message);
+  await Bun.sleep(750);
+  clearing = false;
+  await rival;
+
+  expect(await outcome).toBe("resolved");
+  expect(await readPools(path)).toEqual({ version: 1, pools: { recovered: ["key"] } });
+}, 15_000);
+
 test("serializes mutations across separate processes", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-credential-pool-"));
   const path = join(directory, "credential-pools.json");
