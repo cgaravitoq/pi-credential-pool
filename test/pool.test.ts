@@ -266,6 +266,27 @@ test("classifies the upstream status and honors Retry-After before rotating", as
   expect(pool.entries(started + 2_500)[0]!.health).toBe("ready");
 });
 
+test("classifies the failing response when the attempt keeps fetching afterwards", async () => {
+  const pool = new CredentialPool(["one", "two"]);
+  const attempts: string[] = [];
+  const started = Date.now();
+  const output = createPooledStream(pool, () => undefined, model, (key, fetch) => {
+    attempts.push(key);
+    const result = createAssistantMessageEventStream();
+    void (async () => {
+      const response = await fetch("https://opencode.ai/zen/go/v1/messages", { method: "POST" });
+      if (response.status === 429) await fetch("https://opencode.ai/zen/go/v1/models");
+      result.push((response.status === 429 ? { type: "error", error: { errorMessage: "Too Many Requests" } } : { type: "done", message: { role: "assistant" } }) as never);
+    })();
+    return result;
+  }, async (input) => (attempts.length === 1 && String(input).endsWith("/messages") ? new Response(null, { status: 429, headers: { "retry-after": "30" } }) : new Response(null, { status: 200 })));
+  for await (const _event of output) { /* drain */ }
+  expect(attempts).toEqual(["one", "two"]);
+  expect(pool.entries(started)[0]).toMatchObject({ health: "cooling", lastOutcome: "rate-limited" });
+  expect(pool.entries(started + 29_000)[0]!.health).toBe("cooling");
+  expect(pool.entries(started + 31_000)[0]!.health).toBe("ready");
+});
+
 test("native sidecar auth exposes models and serializes immediate command mutations", async () => {
   const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-home-"));
   const previousHome = process.env.HOME;

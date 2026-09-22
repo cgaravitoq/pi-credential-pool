@@ -41,7 +41,7 @@ export function createPooledStream(pool: CredentialPool, sessionId: () => string
 			let response: StreamMetadata = {};
 			const trackedFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 				const result = await fetcher(input, init);
-				response = { status: result.status, retryAfterMs: retryAfterMs(result.headers.get("retry-after")) };
+				if (result.status >= 400) response = { status: result.status, retryAfterMs: retryAfterMs(result.headers.get("retry-after")) };
 				return result;
 			}) as typeof globalThis.fetch;
 			try {
