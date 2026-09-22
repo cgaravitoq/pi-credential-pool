@@ -787,3 +787,37 @@ test("removes from the store as another session left it while the prompt was ope
 		else process.env.HOME = previousHome;
 	}
 });
+
+test("adds onto an empty store and routes the credential it just persisted", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-empty-add-"));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	const path = join(home, ".pi", "agent", "credential-pools.json");
+	try {
+		const session = await loadExtension();
+		await session.command.handler("add", { ui: { input: async () => "first-key", select: async () => undefined, notify: () => undefined } });
+		expect((await readPools(path)).pools["opencode-go"]).toEqual(["first-key"]);
+		await expectPoolMirrorsStore(session.provider, path);
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
+});
+
+test("stops routing entirely once the last credential is removed", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-empty-remove-"));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	const path = join(home, ".pi", "agent", "credential-pools.json");
+	await writePools({ version: 1, pools: { "opencode-go": ["only-key"] } }, path);
+	try {
+		const session = await loadExtension();
+		const choice = `${fingerprint("only-key")} (${credentialIdentity("only-key").slice(-8)})`;
+		await session.command.handler("remove", { ui: { select: async () => choice, input: async () => undefined, notify: () => undefined } });
+		expect((await readPools(path)).pools["opencode-go"]).toEqual([]);
+		await expectPoolMirrorsStore(session.provider, path);
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
+});
