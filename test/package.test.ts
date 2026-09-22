@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
@@ -12,6 +12,29 @@ async function run(command: string[], env = process.env) {
   ]);
   return { stdout, stderr, exitCode };
 }
+
+test("the packed tarball ships every declared runtime file", async () => {
+  const packed = await run(["npm", "pack", "--dry-run", "--json"]);
+  expect(packed.exitCode, packed.stderr).toBe(0);
+  const [report] = JSON.parse(packed.stdout) as [{ files: { path: string }[] }];
+  const paths = report!.files.map((file) => file.path);
+  const required = ["extensions/pi-credential-pool.ts", "src/pool.ts", "src/storage.ts", "src/usage.ts", "scripts/live-smoke.ts"];
+  expect(required.filter((path) => !paths.includes(path))).toEqual([]);
+});
+
+test("the release workflow runs every gate the CI workflow runs", async () => {
+  const gates = async (name: string) => {
+    const source = await readFile(join(import.meta.dir, "..", ".github", "workflows", name), "utf8");
+    return new Set([...source.matchAll(/run: bun run ([\w:-]+)/g)].map((match) => match[1]!));
+  };
+  const [ci, release] = await Promise.all([gates("ci.yml"), gates("release.yml")]);
+  expect([...ci].filter((gate) => !release.has(gate))).toEqual([]);
+});
+
+test("the CI workflow covers pull requests into base branches containing a slash", async () => {
+  const source = await readFile(join(import.meta.dir, "..", ".github", "workflows", "ci.yml"), "utf8");
+  expect(/pull_request:\s*\n\s*branches:\s*\[([^\]]+)\]/.exec(source)?.[1]).toContain('"**"');
+});
 
 test("the packed extension loads in Pi without package-local peer dependencies", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-credential-pool-package-"));
