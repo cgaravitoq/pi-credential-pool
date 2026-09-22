@@ -692,6 +692,28 @@ test("re-reads the store on turn start so a key removed elsewhere stops routing"
 	}
 });
 
+test("a v1 store written before health was stored still loads and routes", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-v1-load-"));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	const directory = join(home, ".pi", "agent");
+	const path = join(directory, "credential-pools.json");
+	await mkdir(directory, { recursive: true });
+	await writeFile(path, JSON.stringify({ version: 1, pools: { "opencode-go": ["legacy-key"] } }));
+	try {
+		const session = await loadExtension();
+		expect(await routedKeys(session.provider)).toEqual(["legacy-key"]);
+		const health = await waitForHealth(path, (value) => Object.keys(value).length === 1);
+		expect(Object.values(health).map((entry) => entry.state)).toEqual(["disabled"]);
+		const raw = JSON.parse(await readFile(path, "utf8"));
+		expect(raw.version).toBe(1);
+		expect(raw.pools["opencode-go"]).toEqual(["legacy-key"]);
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
+});
+
 test("persists a cooldown to the store when a request is rate limited", async () => {
 	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-flush-"));
 	const previousHome = process.env.HOME;
