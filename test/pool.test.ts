@@ -153,12 +153,35 @@ test("leaves a replacement lock alone when a superseded owner releases late", as
   await mkdir(lockPath, { mode: 0o700 });
   await writeFile(join(lockPath, "owner"), "replacement", { mode: 0o600 });
   releaseFirst();
-  await first;
+  await expect(first).rejects.toThrow("Lost the credential pool storage lock");
 
   expect(await readFile(join(lockPath, "owner"), "utf8")).toBe("replacement");
-  expect(await readPools(path)).toEqual({ version: 1, pools: { first: ["first"] } });
+  expect(await readPools(path)).toEqual({ version: 1, pools: {} });
   await rm(lockPath, { recursive: true, force: true });
 });
+
+test("fails the late write of a frozen holder whose lock was taken over", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-credential-pool-"));
+  const path = join(directory, "credential-pools.json");
+  const lockPath = `${path}.lock`;
+  const readyPath = join(directory, "held");
+  const storage = join(import.meta.dir, "../src/storage.ts");
+  const holder = Bun.spawn(["bun", "-e", `import { SerializedPools } from ${JSON.stringify(storage)};\nawait new SerializedPools().mutate(${JSON.stringify(path)}, async (pools) => { pools.pools.holder = ["holder"]; await Bun.write(${JSON.stringify(readyPath)}, "ready"); await Bun.sleep(500); });`], { stdout: "ignore", stderr: "pipe" });
+  while (!await Bun.file(readyPath).exists()) await Bun.sleep(10);
+
+  process.kill(holder.pid, "SIGSTOP");
+  const frozen = new Date(Date.now() - 31_000);
+  await utimes(join(lockPath, "owner"), frozen, frozen);
+  await utimes(lockPath, frozen, frozen);
+  await new SerializedPools().mutate(path, (pools) => { pools.pools.waiter = ["waiter"]; });
+  process.kill(holder.pid, "SIGCONT");
+
+  const code = await holder.exited;
+  const stderr = await new Response(holder.stderr).text();
+  expect(code).not.toBe(0);
+  expect(stderr).toContain("Lost the credential pool storage lock");
+  expect(await readPools(path)).toEqual({ version: 1, pools: { waiter: ["waiter"] } });
+}, 20_000);
 
 test("never detaches the lock a waiter can grab while an owner is inside its critical section", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-credential-pool-"));
