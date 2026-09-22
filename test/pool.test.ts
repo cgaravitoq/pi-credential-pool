@@ -1,4 +1,4 @@
-import { mkdtemp, stat, utimes } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -112,6 +112,7 @@ test("preserves a replacement lock when a stale owner releases late", async () =
   await secondStarted;
   releaseFirst();
   await first;
+  expect((await stat(`${path}.lock`)).isDirectory()).toBe(true);
   const third = thirdPool.mutate(path, (pools) => {
     startThird();
     pools.pools.third = ["third"];
@@ -121,6 +122,51 @@ test("preserves a replacement lock when a stale owner releases late", async () =
   releaseSecond();
   await Promise.all([second, third]);
   expect(await readPools(path)).toEqual({ version: 1, pools: { second: ["second"], third: ["third"] } });
+});
+
+test("recovers an ownerless lock a crashed holder left behind", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-credential-pool-"));
+  const path = join(directory, "credential-pools.json");
+  const lockPath = `${path}.lock`;
+  await mkdir(lockPath, { mode: 0o700 });
+  const crashed = new Date(Date.now() - 23_000);
+  await utimes(lockPath, crashed, crashed);
+
+  await new SerializedPools().mutate(path, (pools) => { pools.pools.recovered = ["key"]; });
+  expect(await readPools(path)).toEqual({ version: 1, pools: { recovered: ["key"] } });
+}, 15_000);
+
+test("paces the waiting recoverer instead of spinning on one core", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-credential-pool-"));
+  const path = join(directory, "credential-pools.json");
+  const lockPath = `${path}.lock`;
+  const recoveryPath = join(lockPath, "recovery");
+  await mkdir(lockPath, { mode: 0o700 });
+  await writeFile(join(lockPath, "owner"), "abandoned", { mode: 0o600 });
+  await writeFile(recoveryPath, "other", { mode: 0o600 });
+  const stale = new Date(Date.now() - 31_000);
+  await utimes(lockPath, stale, stale);
+
+  const before = process.cpuUsage();
+  const mutation = new SerializedPools().mutate(path, (pools) => { pools.pools.recovered = ["key"]; });
+  await Bun.sleep(500);
+  const spent = process.cpuUsage(before);
+  await rm(lockPath, { recursive: true, force: true });
+  await mutation;
+
+  expect(spent.user + spent.system).toBeLessThan(300_000);
+  expect(await readPools(path)).toEqual({ version: 1, pools: { recovered: ["key"] } });
+}, 15_000);
+
+test("serializes mutations across separate processes", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-credential-pool-"));
+  const path = join(directory, "credential-pools.json");
+  const storage = join(import.meta.dir, "../src/storage.ts");
+  const keys = Array.from({ length: 8 }, (_, index) => `key-${index}`);
+  const children = keys.map((key) => Bun.spawn(["bun", "-e", `import { SerializedPools } from ${JSON.stringify(storage)};\nawait new SerializedPools().mutate(${JSON.stringify(path)}, async (pools) => { pools.pools.keys = [...(pools.pools.keys ?? []), ${JSON.stringify(key)}]; await Bun.sleep(25); });`], { stdout: "ignore", stderr: "pipe" }));
+  const results = await Promise.all(children.map(async (child) => ({ code: await child.exited, stderr: await new Response(child.stderr).text() })));
+  expect(results.filter((result) => result.code !== 0)).toEqual([]);
+  expect((await readPools(path)).pools.keys?.slice().sort()).toEqual([...keys].sort());
 });
 
 test("smoke request sends Pi OpenCode headers with a unique session per credential", async () => {
