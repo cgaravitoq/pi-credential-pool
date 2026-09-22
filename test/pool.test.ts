@@ -125,8 +125,11 @@ test("preserves a replacement lock when a stale owner releases late", async () =
 
 test("smoke request sends Pi OpenCode headers with a unique session per credential", async () => {
   const requests: RequestInit[] = [];
+  const expectedBody = { model: "deepseek-v4-flash", messages: [{ role: "user", content: "Reply with OK." }], max_tokens: 4 };
   const fetchMock = async (_input: string | URL | Request, init?: RequestInit) => {
     requests.push(init!);
+    expect(init?.body).toBeDefined();
+    expect(JSON.parse(init?.body as string)).toEqual(expectedBody);
     return new Response(null, { status: 204 });
   };
   await Promise.all([requestSmoke("first-key", fetchMock), requestSmoke("second-key", fetchMock)]);
