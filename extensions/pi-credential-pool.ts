@@ -199,7 +199,8 @@ export default async function credentialPoolExtension(pi: ExtensionAPI, deps: Po
 			if (action === "add") {
 				const key = await ctx.ui.input("Add OpenCode Go credential", "Paste a credential");
 				if (!key) return;
-				await mutations.mutate(path, (current) => { const keys = [...(current.pools[poolName] ?? []), key]; new CredentialPool(keys); current.pools[poolName] = keys; pool.replace(keys); });
+				const written = await mutations.mutate(path, (current) => { const keys = [...(current.pools[poolName] ?? []), key]; new CredentialPool(keys); current.pools[poolName] = keys; });
+				pool.replace(written.pools[poolName] ?? []);
 				ctx.ui.notify("Credential added");
 				return;
 			}
@@ -210,12 +211,13 @@ export default async function credentialPoolExtension(pi: ExtensionAPI, deps: Po
 				if (!selected) return;
 				const identity = entries[choices.indexOf(selected)]?.identity;
 				if (!identity) return;
-				await mutations.mutate(path, (current) => { const keys = (current.pools[poolName] ?? []).filter((key) => credentialIdentity(key) !== identity); current.pools[poolName] = keys; pool.replace(keys); });
+				const written = await mutations.mutate(path, (current) => { current.pools[poolName] = (current.pools[poolName] ?? []).filter((key) => credentialIdentity(key) !== identity); });
+				pool.replace(written.pools[poolName] ?? []);
 				ctx.ui.notify("Credential removed");
 				return;
 			}
 			if (action === "reset") {
-				await mutations.mutate(path, (current) => { pool.replace(current.pools[poolName] ?? []); pool.reset(); });
+				pool.reset();
 				ctx.ui.notify("Credential health reset");
 				return;
 			}
