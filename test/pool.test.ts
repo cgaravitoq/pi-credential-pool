@@ -180,6 +180,19 @@ test("does not replay after visible output and preserves its provider error", as
   expect((received[1] as { error: { errorMessage: string } }).error.errorMessage).toBe("429 quota");
 });
 
+test("does not rotate once the provider has forwarded its start event", async () => {
+  const pool = new CredentialPool(["one", "two"]);
+  const attempts: string[] = [];
+  const output = createPooledStream(pool, () => undefined, model, (key) => {
+    attempts.push(key);
+    return events({ type: "start", partial: { role: "assistant" } }, { type: "error", error: { errorMessage: "429 quota" } });
+  });
+  const received = [];
+  for await (const event of output) received.push(event);
+  expect(received.map((event) => event.type)).toEqual(["start", "error"]);
+  expect(attempts).toEqual(["one"]);
+});
+
 test("bounds exhausted retries and closes with the final provider error", async () => {
   const pool = new CredentialPool(["one", "two", "three"]);
   const attempts: string[] = [];
@@ -192,6 +205,38 @@ test("bounds exhausted retries and closes with the final provider error", async 
   expect(new Set(attempts)).toEqual(new Set(["one", "two", "three"]));
   expect(received).toHaveLength(1);
   expect((received[0] as { error: { errorMessage: string } }).error.errorMessage).toBe(`429 quota ${attempts.at(-1)}`);
+});
+
+test("caps one turn at three upstream attempts regardless of pool size", async () => {
+  const pool = new CredentialPool(["one", "two", "three", "four", "five"]);
+  const attempts: string[] = [];
+  const output = createPooledStream(pool, () => undefined, model, (key) => {
+    attempts.push(key);
+    return events({ type: "error", error: { errorMessage: `429 quota ${key}` } });
+  });
+  for await (const _event of output) { /* drain */ }
+  expect(attempts).toHaveLength(3);
+  expect(new Set(attempts).size).toBe(3);
+});
+
+test("classifies the upstream status and honors Retry-After before rotating", async () => {
+  const pool = new CredentialPool(["one", "two"]);
+  const attempts: string[] = [];
+  const started = Date.now();
+  const output = createPooledStream(pool, () => undefined, model, (key, fetch) => {
+    attempts.push(key);
+    const result = createAssistantMessageEventStream();
+    void (async () => {
+      const response = await fetch("https://opencode.ai/zen/go/v1/messages", { method: "POST" });
+      result.push((response.status === 429 ? { type: "error", error: { errorMessage: "Too Many Requests" } } : { type: "done", message: { role: "assistant" } }) as never);
+    })();
+    return result;
+  }, async () => new Response(null, { status: 429, headers: { "retry-after": "2" } }));
+  for await (const _event of output) { /* drain */ }
+  expect(attempts).toEqual(["one", "two"]);
+  expect(pool.entries(started)[0]).toMatchObject({ health: "cooling", lastOutcome: "rate-limited" });
+  expect(pool.entries(started + 1_500)[0]!.health).toBe("cooling");
+  expect(pool.entries(started + 2_500)[0]!.health).toBe("ready");
 });
 
 test("native sidecar auth exposes models and serializes immediate command mutations", async () => {
