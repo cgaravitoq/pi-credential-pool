@@ -1,5 +1,5 @@
 export const usageUrl = "https://opencode.ai/zen/go/v1/usage";
-export const usageCacheTtlMs = 5 * 60_000;
+const usageCacheTtlMs = 5 * 60_000;
 
 export type UsageWindowName = "rolling" | "weekly" | "monthly";
 
@@ -21,12 +21,12 @@ export type UsageResult =
 
 const usageWindowNames: readonly UsageWindowName[] = ["rolling", "weekly", "monthly"];
 
-function record(value: unknown): value is Record<string, unknown> {
+function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function parseWindow(name: UsageWindowName, value: unknown): UsageWindow | undefined {
-  if (!record(value)) return undefined;
+  if (!isRecord(value)) return undefined;
   const percent = value.percent;
   if (typeof percent !== "number" || !Number.isFinite(percent) || percent < 0 || percent > 100) return undefined;
   const status = value.status;
@@ -39,7 +39,7 @@ function parseWindow(name: UsageWindowName, value: unknown): UsageWindow | undef
 // All-or-nothing: a partial response must not replace a complete last-good
 // report, so any malformed window makes the whole payload a transient failure.
 export function parseUsageReport(payload: unknown, fetchedAt = Date.now()): UsageReport | undefined {
-  if (!record(payload) || !record(payload.usage)) return undefined;
+  if (!isRecord(payload) || !isRecord(payload.usage)) return undefined;
   const usage = payload.usage;
   const windows: UsageWindow[] = [];
   for (const name of usageWindowNames) {
@@ -53,7 +53,7 @@ export function parseUsageReport(payload: unknown, fetchedAt = Date.now()): Usag
 async function upstreamMessage(response: Response): Promise<string> {
   try {
     const payload: unknown = await response.json();
-    if (record(payload) && record(payload.error) && typeof payload.error.message === "string") return payload.error.message;
+    if (isRecord(payload) && isRecord(payload.error) && typeof payload.error.message === "string") return payload.error.message;
   } catch {
     // Body is optional detail; the status is the contract.
   }
