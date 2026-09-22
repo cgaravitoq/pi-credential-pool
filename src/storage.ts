@@ -24,24 +24,18 @@ async function acquireMutationLock(path: string): Promise<() => Promise<void>> {
       await mkdir(lockPath, { mode: 0o700 });
       await writeFile(ownerPath, owner, { encoding: "utf8", flag: "wx", mode: 0o600 });
       return async () => {
-        const releasing = `${lockPath}.release-${owner}`;
         try {
-          await rename(lockPath, releasing);
+          if (await readFile(ownerPath, "utf8") !== owner) return;
         } catch (error) {
           if (missing(error)) return;
           throw error;
         }
-        let held: string | undefined;
+        await rm(ownerPath, { force: true });
         try {
-          held = await readFile(join(releasing, "owner"), "utf8");
+          await rmdir(lockPath);
         } catch (error) {
-          if (!missing(error)) throw error;
+          if (!missing(error) && (error as NodeJS.ErrnoException).code !== "ENOTEMPTY") throw error;
         }
-        if (held !== owner) {
-          await rename(releasing, lockPath);
-          return;
-        }
-        await rm(releasing, { recursive: true, force: true });
       };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
