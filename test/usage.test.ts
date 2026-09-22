@@ -24,7 +24,7 @@ function json(body: unknown, status = 200) {
 
 type Request = { url: string; init?: RequestInit };
 
-async function harness(options: { keys?: string[]; now?: () => number; respond: (key: string) => Response | Promise<Response> }) {
+async function harness(options: { keys?: string[]; now?: () => number; respond: (key: string, init?: RequestInit) => Response | Promise<Response> }) {
   const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-usage-"));
   const previousHome = process.env.HOME;
   process.env.HOME = home;
@@ -34,7 +34,7 @@ async function harness(options: { keys?: string[]; now?: () => number; respond: 
   const fetcher: FetchLike = async (input, init) => {
     requests.push({ url: String(input), init });
     const authorization = new Headers(init?.headers).get("authorization") ?? "";
-    return options.respond(authorization.replace(/^Bearer /, ""));
+    return options.respond(authorization.replace(/^Bearer /, ""), init);
   };
   let command: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
   const extension = {
@@ -202,6 +202,69 @@ describe("credential-pool usage command", () => {
     await session.run("usage");
     expect(session.requests).toHaveLength(0);
     expect(session.output()).toBe("No credentials configured");
+  });
+
+  test("holds the fan-out at four requests in flight for a pool of eight", async () => {
+    const many = Array.from({ length: 8 }, (_, index) => `cap-key-${index}`);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let inFlight = 0;
+    let peak = 0;
+    const session = await harness({
+      keys: many,
+      respond: async () => {
+        inFlight += 1;
+        peak = Math.max(peak, inFlight);
+        await gate;
+        inFlight -= 1;
+        return json(usageBody(1, 2, 3));
+      },
+    });
+    const running = session.run("usage");
+    for (let attempt = 0; attempt < 50 && session.requests.length < 4; attempt++) await Bun.sleep(5);
+    expect(session.requests).toHaveLength(4);
+    await Bun.sleep(25);
+    expect(inFlight).toBe(4);
+    expect(session.requests).toHaveLength(4);
+    release();
+    await running;
+    expect(peak).toBe(4);
+    expect(session.requests).toHaveLength(8);
+    expect(session.output()).toContain("Account 8");
+  });
+
+  test("gives each usage request a 10s abort deadline and renders last good when it fires", async () => {
+    let now = 1_000_000;
+    let stall = false;
+    const deadlines: number[] = [];
+    const realTimeout = AbortSignal.timeout;
+    AbortSignal.timeout = ((milliseconds: number) => { deadlines.push(milliseconds); return realTimeout(Math.min(milliseconds, 400)); }) as typeof AbortSignal.timeout;
+    try {
+      const session = await harness({
+        keys: ["stall-key"],
+        now: () => now,
+        respond: (_key, init) => {
+          const signal = init?.signal;
+          if (!signal) throw new Error("usage request must carry an abort signal");
+          if (!stall) return json(usageBody(10, 20, 30));
+          return new Promise<Response>((_resolve, reject) => { signal.addEventListener("abort", () => reject(signal.reason)); });
+        },
+      });
+      await session.run("usage");
+      expect(session.output()).toContain("monthly 30% ok");
+      now += 300_000;
+      stall = true;
+      session.notifications.length = 0;
+      const started = Date.now();
+      await session.run("usage");
+      expect(Date.now() - started).toBeLessThan(5_000);
+      expect(deadlines).toEqual([10_000, 10_000]);
+      expect(session.requests).toHaveLength(2);
+      expect(session.output()).toContain("stale: last good data kept after");
+      expect(session.output()).toContain("monthly 30% ok");
+    } finally {
+      AbortSignal.timeout = realTimeout;
+    }
   });
 });
 

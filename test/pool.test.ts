@@ -1,8 +1,8 @@
-import { mkdtemp, stat, utimes } from "node:fs/promises";
+import { mkdir, mkdtemp, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
-import { CredentialPool, fingerprint, retryAfterMs } from "../src/pool.ts";
+import { CredentialPool, credentialIdentity, fingerprint, retryAfterMs } from "../src/pool.ts";
 import { readPools, SerializedPools, writePools } from "../src/storage.ts";
 import { createPooledStream } from "../extensions/pi-credential-pool.ts";
 import credentialPoolExtension from "../extensions/pi-credential-pool.ts";
@@ -369,4 +369,89 @@ test("native sidecar auth exposes models and serializes immediate command mutati
     if (previousHome === undefined) delete process.env.HOME;
     else process.env.HOME = previousHome;
   }
+});
+
+async function loadExtension() {
+	type Handler = (event: unknown, ctx: unknown) => void | Promise<void>;
+	const handlers = new Map<string, Handler[]>();
+	let command: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
+	const providers: unknown[] = [];
+	await credentialPoolExtension({
+		on: (name: string, handler: Handler) => handlers.set(name, [...(handlers.get(name) ?? []), handler]),
+		registerProvider: (value: unknown) => providers.push(value),
+		unregisterProvider: () => undefined,
+		registerCommand: (_name: string, value: unknown) => { command = value as typeof command; },
+	} as any);
+	return { handlers, command: command!, provider: providers.at(-1)! };
+}
+
+async function routedKeys(provider: any): Promise<string[]> {
+	const model = opencodeGoProvider().getModels()[0]!;
+	const used: string[] = [];
+	const output = provider.streamSimple(model, { messages: [{ role: "user", content: "hi" }] }, {
+		fetch: async (_input: string | URL | Request, init?: RequestInit) => {
+			const headers = new Headers(init?.headers);
+			used.push(headers.get("x-api-key") ?? (headers.get("authorization") ?? "").replace(/^Bearer /, ""));
+			return new Response(null, { status: 401 });
+		},
+	});
+	for await (const _event of output) { /* drain */ }
+	return used;
+}
+
+test("re-reads the store on turn start so a key removed elsewhere stops routing", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-sync-"));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	const path = join(home, ".pi", "agent", "credential-pools.json");
+	const poolKeys = ["sync-key-one", "sync-key-two", "sync-key-three"];
+	await writePools({ version: 1, pools: { "opencode-go": poolKeys } }, path);
+	try {
+		const first = await loadExtension();
+		const stale = await loadExtension();
+		const second = await loadExtension();
+		const choices = poolKeys.map((key) => `${fingerprint(key)} (${credentialIdentity(key).slice(-8)})`);
+		await first.command.handler("remove", { ui: { select: async () => choices[1], input: async () => undefined, notify: () => undefined } });
+		expect((await readPools(path)).pools["opencode-go"]).toEqual([poolKeys[0], poolKeys[2]]);
+		expect(await routedKeys(stale.provider)).toContain(poolKeys[1]);
+		for (const handler of second.handlers.get("turn_start") ?? []) await handler({ type: "turn_start", turnIndex: 0, timestamp: 0 }, {});
+		const used = await routedKeys(second.provider);
+		expect(used).not.toContain(poolKeys[1]);
+		expect(used).toEqual([poolKeys[0], poolKeys[2]]);
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
+});
+
+test("keeps the in-memory pool unchanged when the store write fails", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-write-"));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	const directory = join(home, ".pi", "agent");
+	const path = join(directory, "credential-pools.json");
+	await writePools({ version: 1, pools: { "opencode-go": ["kept-key"] } }, path);
+	try {
+		const session = await loadExtension();
+		const frozenNow = 1_900_000_000_000;
+		await mkdir(join(directory, `credential-pools.json.${process.pid}.${frozenNow}.tmp`));
+		const realNow = Date.now;
+		Date.now = () => frozenNow;
+		let failure: unknown;
+		try {
+			await session.command.handler("add", { ui: { input: async () => "unwritten-key", select: async () => undefined, notify: () => undefined } }).catch((error) => { failure = error; });
+		} finally {
+			Date.now = realNow;
+		}
+		expect(failure).toBeInstanceOf(Error);
+		expect((await readPools(path)).pools["opencode-go"]).toEqual(["kept-key"]);
+		const notifications: string[] = [];
+		await session.command.handler("list", { ui: { notify: (message: string) => notifications.push(message), input: async () => undefined, select: async () => undefined } });
+		const listing = notifications.join("\n");
+		expect(listing).toContain(fingerprint("kept-key"));
+		expect(listing).not.toContain(fingerprint("unwritten-key"));
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
 });
