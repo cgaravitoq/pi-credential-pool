@@ -12,7 +12,8 @@ Pi loads the package extension automatically.
 
 Credentials are stored only in `~/.pi/agent/credential-pools.json`.
 Use `/credential-pool add` and paste a key in Pi's input dialog.
-Use `/credential-pool list` to see short fingerprints, health, and routing activity, `/credential-pool remove` to select a fingerprint, `/credential-pool reset` to clear temporary health state, and `/credential-pool usage` for per-account usage.
+Use `/credential-pool list` to see short fingerprints, health, and routing activity, `/credential-pool remove` to select a fingerprint, `/credential-pool reset` to clear health state, and `/credential-pool usage` for per-account usage.
+Cooldowns and disabled credentials are stored in the sidecar file by credential identity, so every running Pi session observes the same health and `/credential-pool reset` clears it for all of them.
 Commands never accept a secret as an argument.
 
 `/credential-pool usage` calls `GET https://opencode.ai/zen/go/v1/usage` once per stored key, in parallel, with `Authorization: Bearer <key>`, `accept: application/json`, `x-opencode-client: pi`, and one stable non-secret session identifier for the run.
