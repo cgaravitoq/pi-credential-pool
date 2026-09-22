@@ -665,3 +665,60 @@ test("re-reads the store at the command boundary with no turn start in between",
 		else process.env.HOME = previousHome;
 	}
 });
+
+test("refuses a duplicate key without poisoning the store", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-duplicate-"));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	const path = join(home, ".pi", "agent", "credential-pools.json");
+	await writePools({ version: 1, pools: { "opencode-go": ["seed-key"] } }, path);
+	try {
+		const session = await loadExtension();
+		let failure: unknown;
+		await session.command.handler("add", { ui: { input: async () => "seed-key", select: async () => undefined, notify: () => undefined } }).catch((error) => { failure = error; });
+		expect(failure).toBeInstanceOf(Error);
+		expect((await readPools(path)).pools["opencode-go"]).toEqual(["seed-key"]);
+		await expect(loadExtension()).resolves.toBeDefined();
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
+});
+
+test("adds onto the store as another session left it while the prompt was open", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-prompt-race-"));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	const path = join(home, ".pi", "agent", "credential-pools.json");
+	await writePools({ version: 1, pools: { "opencode-go": ["seed-key"] } }, path);
+	try {
+		const session = await loadExtension();
+		const input = async () => {
+			await writePools({ version: 1, pools: { "opencode-go": ["seed-key", "other-session-key"] } }, path);
+			return "added-key";
+		};
+		await session.command.handler("add", { ui: { input, select: async () => undefined, notify: () => undefined } });
+		expect((await readPools(path)).pools["opencode-go"]).toEqual(["seed-key", "other-session-key", "added-key"]);
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
+});
+
+test("treats a cancelled add prompt as a no-op", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-cancel-"));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	const path = join(home, ".pi", "agent", "credential-pools.json");
+	await writePools({ version: 1, pools: { "opencode-go": ["seed-key"] } }, path);
+	try {
+		const session = await loadExtension();
+		const notifications: string[] = [];
+		await session.command.handler("add", { ui: { input: async () => undefined, select: async () => undefined, notify: (message: string) => notifications.push(message) } });
+		expect(notifications).toEqual([]);
+		expect((await readPools(path)).pools["opencode-go"]).toEqual(["seed-key"]);
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
+});
