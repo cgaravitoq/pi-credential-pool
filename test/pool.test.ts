@@ -722,3 +722,37 @@ test("treats a cancelled add prompt as a no-op", async () => {
 		else process.env.HOME = previousHome;
 	}
 });
+
+test("keeps the in-memory pool unchanged when the remove write fails", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-remove-write-"));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	const directory = join(home, ".pi", "agent");
+	const path = join(directory, "credential-pools.json");
+	const poolKeys = ["kept-one", "doomed-two"];
+	await writePools({ version: 1, pools: { "opencode-go": poolKeys } }, path);
+	try {
+		const session = await loadExtension();
+		const choices = poolKeys.map((key) => `${fingerprint(key)} (${credentialIdentity(key).slice(-8)})`);
+		const frozenNow = 1_900_000_000_000;
+		await mkdir(join(directory, `credential-pools.json.${process.pid}.${frozenNow}.tmp`));
+		const realNow = Date.now;
+		Date.now = () => frozenNow;
+		let failure: unknown;
+		try {
+			await session.command.handler("remove", { ui: { select: async () => choices[1], input: async () => undefined, notify: () => undefined } }).catch((error) => { failure = error; });
+		} finally {
+			Date.now = realNow;
+		}
+		expect(failure).toBeInstanceOf(Error);
+		expect((await readPools(path)).pools["opencode-go"]).toEqual(poolKeys);
+		const notifications: string[] = [];
+		await session.command.handler("list", { ui: { notify: (message: string) => notifications.push(message), input: async () => undefined, select: async () => undefined } });
+		const listing = notifications.join("\n");
+		expect(listing).toContain(fingerprint(poolKeys[0]!));
+		expect(listing).toContain(fingerprint(poolKeys[1]!));
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
+});
