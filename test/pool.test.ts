@@ -567,6 +567,11 @@ async function routedKeys(provider: any): Promise<string[]> {
 	return used;
 }
 
+async function expectPoolMirrorsStore(provider: any, path: string): Promise<void> {
+	const stored = (await readPools(path)).pools["opencode-go"] ?? [];
+	expect([...await routedKeys(provider)].sort()).toEqual([...stored].sort());
+}
+
 test("re-reads the store on turn start so a key removed elsewhere stops routing", async () => {
 	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-sync-"));
 	const previousHome = process.env.HOME;
@@ -618,6 +623,7 @@ test("keeps the in-memory pool unchanged when the store write fails", async () =
 		const listing = notifications.join("\n");
 		expect(listing).toContain(fingerprint("kept-key"));
 		expect(listing).not.toContain(fingerprint("unwritten-key"));
+		await expectPoolMirrorsStore(session.provider, path);
 	} finally {
 		if (previousHome === undefined) delete process.env.HOME;
 		else process.env.HOME = previousHome;
@@ -699,6 +705,7 @@ test("adds onto the store as another session left it while the prompt was open",
 		};
 		await session.command.handler("add", { ui: { input, select: async () => undefined, notify: () => undefined } });
 		expect((await readPools(path)).pools["opencode-go"]).toEqual(["seed-key", "other-session-key", "added-key"]);
+		await expectPoolMirrorsStore(session.provider, path);
 	} finally {
 		if (previousHome === undefined) delete process.env.HOME;
 		else process.env.HOME = previousHome;
@@ -751,6 +758,30 @@ test("keeps the in-memory pool unchanged when the remove write fails", async () 
 		const listing = notifications.join("\n");
 		expect(listing).toContain(fingerprint(poolKeys[0]!));
 		expect(listing).toContain(fingerprint(poolKeys[1]!));
+		await expectPoolMirrorsStore(session.provider, path);
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
+});
+
+test("removes from the store as another session left it while the prompt was open", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-remove-race-"));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	const path = join(home, ".pi", "agent", "credential-pools.json");
+	const poolKeys = ["race-kept-one", "race-doomed-two"];
+	await writePools({ version: 1, pools: { "opencode-go": poolKeys } }, path);
+	try {
+		const session = await loadExtension();
+		const choices = poolKeys.map((key) => `${fingerprint(key)} (${credentialIdentity(key).slice(-8)})`);
+		const select = async () => {
+			await writePools({ version: 1, pools: { "opencode-go": [...poolKeys, "other-session-key"] } }, path);
+			return choices[1];
+		};
+		await session.command.handler("remove", { ui: { select, input: async () => undefined, notify: () => undefined } });
+		expect((await readPools(path)).pools["opencode-go"]).toEqual(["race-kept-one", "other-session-key"]);
+		await expectPoolMirrorsStore(session.provider, path);
 	} finally {
 		if (previousHome === undefined) delete process.env.HOME;
 		else process.env.HOME = previousHome;
