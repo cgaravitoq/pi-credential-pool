@@ -14,7 +14,7 @@ export type Failure = { status?: number; retryAfterMs?: number; quota?: boolean 
 
 export type AttemptOutcome = "ok" | "unauthorized" | "forbidden" | "rate-limited" | "quota" | "error";
 
-export type RoutingActivity = {
+type RoutingActivity = {
   attempts: number;
   lastUsedAt?: number;
   lastOutcome?: AttemptOutcome;

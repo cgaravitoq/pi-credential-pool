@@ -68,6 +68,15 @@ describe("usage report parsing", () => {
     expect(parseUsageReport(null)).toBeUndefined();
   });
 
+  test("rejects a non-string status and an out-of-range percent instead of repairing them", () => {
+    const body = (rolling: unknown) => ({ usage: { rolling, weekly: { percent: 1, status: "ok", resetsAt }, monthly: { percent: 1, status: "ok", resetsAt } } });
+    expect(parseUsageReport(body({ percent: 1, status: 2, resetsAt }))).toBeUndefined();
+    expect(parseUsageReport(body({ percent: 1, status: "", resetsAt }))).toBeUndefined();
+    expect(parseUsageReport(body({ percent: 150, status: "ok", resetsAt }))).toBeUndefined();
+    expect(parseUsageReport(body({ percent: -1, status: "ok", resetsAt }))).toBeUndefined();
+    expect(parseUsageReport(usageBody(0, 50, 100), 1_000)?.windows.map((window) => window.percent)).toEqual([0, 50, 100]);
+  });
+
   test("keeps a report fresh for five minutes and retains it as last good", () => {
     const cache = new UsageCache();
     const report = parseUsageReport(usageBody(10, 20, 30), 1_000)!;
@@ -159,6 +168,32 @@ describe("credential-pool usage command", () => {
     session.notifications.length = 0;
     await session.run("usage");
     expect(session.output()).toContain("monthly 30% ok");
+    expect(session.requests).toHaveLength(9);
+  });
+
+  test("leaves the cached last-good report untouched when a refresh returns malformed windows", async () => {
+    let now = 1_000_000;
+    let malformed = false;
+    const session = await harness({
+      now: () => now,
+      respond: () => malformed
+        ? json({ usage: { rolling: { percent: 150, status: 2, resetsAt }, weekly: { percent: 150, status: 2, resetsAt }, monthly: { percent: 150, status: 2, resetsAt } } })
+        : json(usageBody(10, 20, 30)),
+    });
+    await session.run("usage");
+    expect(session.output()).toContain("monthly 30% ok");
+    now += 300_000;
+    malformed = true;
+    session.notifications.length = 0;
+    await session.run("usage");
+    expect(session.output()).toContain("stale: last good data kept after malformed usage response");
+    expect(session.output()).toContain("monthly 30% ok");
+    now += 1_000;
+    session.notifications.length = 0;
+    await session.run("usage");
+    expect(session.output()).toContain("monthly 30% ok");
+    expect(session.output()).not.toContain("monthly 100%");
+    expect(session.output()).not.toContain("monthly window exhausted");
     expect(session.requests).toHaveLength(9);
   });
 
