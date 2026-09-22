@@ -26,7 +26,7 @@ function failureFrom(response: StreamMetadata, message = ""): Failure {
 }
 
 function errorEvent(model: Model<Api>, error: unknown): Extract<AssistantMessageEvent, { type: "error" }> {
-	return { type: "error", reason: "error", error: { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "error", errorMessage: error instanceof Error ? error.message : "Credential pool failed", timestamp: Date.now() } } as Extract<AssistantMessageEvent, { type: "error" }>;
+	return { type: "error", reason: "error", error: { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "error", errorMessage: error instanceof Error ? error.message : "Credential pool failed", timestamp: Date.now() } };
 }
 
 export function createPooledStream(pool: CredentialPool, sessionId: () => string | undefined, model: Model<Api>, stream: ProviderStream, fetcher: FetchLike = globalThis.fetch): AssistantMessageEventStream {
@@ -181,8 +181,10 @@ export default async function credentialPoolExtension(pi: ExtensionAPI, deps: Po
 		// Pi's persisted/remote catalog lives in the provider the runtime already composed.
 		// Restoring it as this provider's base keeps refreshed models selectable.
 		pi.unregisterProvider(poolName);
-		const live = ctx.modelRegistry.getProvider(poolName) as GoProvider | undefined;
-		if (live && live !== provider) { catalog.current = live; restoredCatalog.models = []; pi.registerProvider(provider); }
+		const live = (ctx.modelRegistry.getProvider(poolName) ?? builtin) as GoProvider;
+		catalog.current = live;
+		restoredCatalog.models = [];
+		pi.registerProvider(provider);
 	});
 	pi.on("turn_start", async () => { await syncFromStore(); });
 	pi.registerCommand("credential-pool", {
@@ -212,7 +214,11 @@ export default async function credentialPoolExtension(pi: ExtensionAPI, deps: Po
 			if (action === "add") {
 				const key = await ctx.ui.input("Add OpenCode Go credential", "Paste a credential");
 				if (!key) return;
-				const written = await mutations.mutate(path, (current) => { const keys = [...(current.pools[poolName] ?? []), key]; new CredentialPool(keys); current.pools[poolName] = keys; });
+				const written = await mutations.mutate(path, (current) => {
+					const existing = current.pools[poolName] ?? [];
+					if (!key.trim() || existing.includes(key)) throw new Error("Credential keys must be distinct and non-empty");
+					current.pools[poolName] = [...existing, key];
+				});
 				pool.replace(written.pools[poolName] ?? []);
 				ctx.ui.notify("Credential added");
 				return;
