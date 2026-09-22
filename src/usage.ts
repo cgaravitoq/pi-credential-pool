@@ -28,11 +28,12 @@ function record(value: unknown): value is Record<string, unknown> {
 function parseWindow(name: UsageWindowName, value: unknown): UsageWindow | undefined {
   if (!record(value)) return undefined;
   const percent = value.percent;
-  if (typeof percent !== "number" || !Number.isFinite(percent)) return undefined;
-  const status = typeof value.status === "string" && value.status ? value.status : "unknown";
+  if (typeof percent !== "number" || !Number.isFinite(percent) || percent < 0 || percent > 100) return undefined;
+  const status = value.status;
+  if (typeof status !== "string" || !status) return undefined;
   const parsed = typeof value.resetsAt === "string" ? Date.parse(value.resetsAt) : typeof value.resetsAt === "number" ? value.resetsAt : Number.NaN;
   if (!Number.isFinite(parsed)) return undefined;
-  return { name, percent: Math.min(100, Math.max(0, percent)), status, resetsAt: parsed };
+  return { name, percent, status, resetsAt: parsed };
 }
 
 // All-or-nothing: a partial response must not replace a complete last-good
