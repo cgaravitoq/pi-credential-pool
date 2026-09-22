@@ -149,6 +149,15 @@ function events(...items: unknown[]) {
   return stream;
 }
 
+function throwingEvents(message: string, ...items: unknown[]) {
+  return Object.assign(createAssistantMessageEventStream(), {
+    async *[Symbol.asyncIterator]() {
+      for (const item of items) yield item as never;
+      throw new Error(message);
+    },
+  });
+}
+
 test("retries three distinct siblings before visible output and terminates", async () => {
   const pool = new CredentialPool(["one", "two", "three"]);
   const expected = pool.select("stable")!.key;
@@ -191,6 +200,21 @@ test("does not rotate once the provider has forwarded its start event", async ()
   for await (const event of output) received.push(event);
   expect(received.map((event) => event.type)).toEqual(["start", "error"]);
   expect(attempts).toEqual(["one"]);
+});
+
+test("does not rotate when a classifiable exception follows its forwarded start event", async () => {
+  const pool = new CredentialPool(["one", "two"]);
+  const attempts: string[] = [];
+  const output = createPooledStream(pool, () => undefined, model, (key) => {
+    attempts.push(key);
+    return throwingEvents("429 quota exceeded", { type: "start", partial: { role: "assistant" } }, { type: "text_delta", delta: "partial" });
+  });
+  const received = [];
+  for await (const event of output) received.push(event);
+  expect(attempts).toEqual(["one"]);
+  expect(received.map((event) => event.type)).toEqual(["start", "text_delta", "error"]);
+  expect((received[2] as { error: { errorMessage: string } }).error.errorMessage).toBe("429 quota exceeded");
+  expect(pool.entries()[0]).toMatchObject({ health: "ready", lastOutcome: "error" });
 });
 
 test("bounds exhausted retries and closes with the final provider error", async () => {
