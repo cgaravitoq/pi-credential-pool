@@ -821,3 +821,65 @@ test("stops routing entirely once the last credential is removed", async () => {
 		else process.env.HOME = previousHome;
 	}
 });
+
+test("adopts neither side of a raced add whose store write failed", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-raced-add-fail-"));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	const directory = join(home, ".pi", "agent");
+	const path = join(directory, "credential-pools.json");
+	await writePools({ version: 1, pools: { "opencode-go": ["kept-key"] } }, path);
+	const realNow = Date.now;
+	try {
+		const session = await loadExtension();
+		const frozenNow = 1_900_000_000_000;
+		await mkdir(join(directory, `credential-pools.json.${process.pid}.${frozenNow}.tmp`));
+		const input = async () => {
+			await writePools({ version: 1, pools: { "opencode-go": ["kept-key", "other-session-key"] } }, path);
+			Date.now = () => frozenNow;
+			return "unwritten-key";
+		};
+		let failure: unknown;
+		await session.command.handler("add", { ui: { input, select: async () => undefined, notify: () => undefined } }).catch((error) => { failure = error; });
+		Date.now = realNow;
+		expect(failure).toBeInstanceOf(Error);
+		expect((await readPools(path)).pools["opencode-go"]).toEqual(["kept-key", "other-session-key"]);
+		expect(await routedKeys(session.provider)).toEqual(["kept-key"]);
+	} finally {
+		Date.now = realNow;
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
+});
+
+test("adopts neither side of a raced remove whose store write failed", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-raced-remove-fail-"));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	const directory = join(home, ".pi", "agent");
+	const path = join(directory, "credential-pools.json");
+	const poolKeys = ["raced-kept", "raced-doomed"];
+	await writePools({ version: 1, pools: { "opencode-go": poolKeys } }, path);
+	const realNow = Date.now;
+	try {
+		const session = await loadExtension();
+		const choices = poolKeys.map((key) => `${fingerprint(key)} (${credentialIdentity(key).slice(-8)})`);
+		const frozenNow = 1_900_000_000_000;
+		await mkdir(join(directory, `credential-pools.json.${process.pid}.${frozenNow}.tmp`));
+		const select = async () => {
+			await writePools({ version: 1, pools: { "opencode-go": [...poolKeys, "other-session-key"] } }, path);
+			Date.now = () => frozenNow;
+			return choices[1];
+		};
+		let failure: unknown;
+		await session.command.handler("remove", { ui: { select, input: async () => undefined, notify: () => undefined } }).catch((error) => { failure = error; });
+		Date.now = realNow;
+		expect(failure).toBeInstanceOf(Error);
+		expect((await readPools(path)).pools["opencode-go"]).toEqual([...poolKeys, "other-session-key"]);
+		expect(await routedKeys(session.provider)).toEqual(poolKeys);
+	} finally {
+		Date.now = realNow;
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
+});
