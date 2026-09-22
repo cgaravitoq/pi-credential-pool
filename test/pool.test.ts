@@ -455,3 +455,45 @@ test("keeps the in-memory pool unchanged when the store write fails", async () =
 		else process.env.HOME = previousHome;
 	}
 });
+
+test("refuses a whitespace-only key without touching the store", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-blank-"));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	const path = join(home, ".pi", "agent", "credential-pools.json");
+	await writePools({ version: 1, pools: { "opencode-go": ["seed-key"] } }, path);
+	try {
+		const session = await loadExtension();
+		let failure: unknown;
+		await session.command.handler("add", { ui: { input: async () => "   ", select: async () => undefined, notify: () => undefined } }).catch((error) => { failure = error; });
+		expect(failure).toBeInstanceOf(Error);
+		expect((await readPools(path)).pools["opencode-go"]).toEqual(["seed-key"]);
+		await expect(loadExtension()).resolves.toBeDefined();
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
+});
+
+test("re-reads the store at the command boundary with no turn start in between", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-command-sync-"));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	const path = join(home, ".pi", "agent", "credential-pools.json");
+	const poolKeys = ["command-key-one", "command-key-two"];
+	await writePools({ version: 1, pools: { "opencode-go": poolKeys } }, path);
+	try {
+		const reader = await loadExtension();
+		const mutator = await loadExtension();
+		const choices = poolKeys.map((key) => `${fingerprint(key)} (${credentialIdentity(key).slice(-8)})`);
+		await mutator.command.handler("remove", { ui: { select: async () => choices[1], input: async () => undefined, notify: () => undefined } });
+		const notifications: string[] = [];
+		await reader.command.handler("list", { ui: { notify: (message: string) => notifications.push(message), input: async () => undefined, select: async () => undefined } });
+		const listing = notifications.join("\n");
+		expect(listing).toContain(fingerprint(poolKeys[0]!));
+		expect(listing).not.toContain(fingerprint(poolKeys[1]!));
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
+});
