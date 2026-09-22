@@ -1,3 +1,4 @@
+import { stat } from "node:fs/promises";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type Api, type AssistantMessageEvent, type AssistantMessageEventStream, type Model, type ModelsStoreEntry, type Provider } from "@earendil-works/pi-ai";
 import { builtinProviders, getBuiltinModelDataGeneratedAt } from "@earendil-works/pi-ai/providers/all";
@@ -128,8 +129,17 @@ export function renderUsage(entry: CredentialEntry, index: number, outcome: Usag
 
 export default async function credentialPoolExtension(pi: ExtensionAPI, deps: PoolExtensionDeps = {}): Promise<void> {
 	const path = defaultStorePath();
+	const readStoreMtime = async (): Promise<number | undefined> => (await stat(path).catch(() => undefined))?.mtimeMs;
+	let storeMtimeMs = await readStoreMtime();
 	const stored = await readPools(path);
 	const pool = new CredentialPool(stored.pools[poolName] ?? []);
+	const syncFromStore = async (): Promise<void> => {
+		const mtimeMs = await readStoreMtime();
+		if (mtimeMs === storeMtimeMs) return;
+		storeMtimeMs = mtimeMs;
+		const current = await readPools(path);
+		pool.replace(current.pools[poolName] ?? []);
+	};
 	const builtin = builtinProviders().find((provider) => provider.id === poolName) as GoProvider | undefined;
 	if (!builtin) throw new Error("OpenCode Go provider is unavailable");
 	const catalog: CatalogRef = { current: builtin };
@@ -162,10 +172,12 @@ export default async function credentialPoolExtension(pi: ExtensionAPI, deps: Po
 		const live = ctx.modelRegistry.getProvider(poolName) as GoProvider | undefined;
 		if (live && live !== provider) { catalog.current = live; restoredCatalog.models = []; pi.registerProvider(provider); }
 	});
+	pi.on("turn_start", async () => { await syncFromStore(); });
 	pi.registerCommand("credential-pool", {
 		description: "Manage the local OpenCode Go credential pool",
 		handler: async (args, ctx) => {
 			const action = args.trim();
+			await syncFromStore();
 			if (action === "list") { ctx.ui.notify(pool.entries().map((entry) => `${entry.fingerprint} ${entry.health} attempts=${entry.attempts} last-used=${entry.lastUsedAt === undefined ? "never" : formatTime(entry.lastUsedAt)} outcome=${entry.lastOutcome ?? "none"}${entry.lastSelected ? " last-selected" : ""}`).join("\n") || "No credentials configured"); return; }
 			if (action === "usage") {
 				const now = deps.now ?? Date.now;
