@@ -18,14 +18,16 @@ const sleep = (milliseconds: number) => new Promise<void>((resolve) => setTimeou
 const errorCode = (error: unknown) => (error as NodeJS.ErrnoException).code;
 const missing = (error: unknown) => errorCode(error) === "ENOENT";
 
-async function ownedBy(ownerPath: string, owner: string): Promise<boolean> {
+async function readIfPresent(target: string): Promise<string | undefined> {
   try {
-    return await readFile(ownerPath, "utf8") === owner;
+    return await readFile(target, "utf8");
   } catch (error) {
-    if (missing(error)) return false;
+    if (missing(error)) return undefined;
     throw error;
   }
 }
+
+const ownedBy = async (ownerPath: string, owner: string) => await readIfPresent(ownerPath) === owner;
 
 async function mtimeOf(target: string): Promise<number | undefined> {
   try {
@@ -44,11 +46,7 @@ async function lockSignal(lockPath: string, ownerPath: string): Promise<LockSign
 }
 
 async function dropRecovery(recoveryPath: string, recovery: string): Promise<void> {
-  try {
-    if (await readFile(recoveryPath, "utf8") === recovery) await rm(recoveryPath, { force: true });
-  } catch (error) {
-    if (!missing(error)) throw error;
-  }
+  if (await readIfPresent(recoveryPath) === recovery) await rm(recoveryPath, { force: true });
 }
 
 async function recoverStaleLock(lockPath: string, ownerPath: string, recoveryPath: string, signal: LockSignal): Promise<void> {
@@ -56,12 +54,13 @@ async function recoverStaleLock(lockPath: string, ownerPath: string, recoveryPat
   try {
     await writeFile(recoveryPath, recovery, { encoding: "utf8", flag: "wx", mode: 0o600 });
   } catch (error) {
+    if (missing(error)) return;
     if (errorCode(error) !== "EEXIST") throw error;
     const claimed = await mtimeOf(recoveryPath);
     if (claimed !== undefined && Date.now() - claimed > recoveryConfirmMs + lockWaitMs) await rm(recoveryPath, { force: true });
     return;
   }
-  if (await readFile(recoveryPath, "utf8") !== recovery) return;
+  if (await readIfPresent(recoveryPath) !== recovery) return;
   if (signal.owned) {
     await sleep(recoveryConfirmMs);
     const current = await lockSignal(lockPath, ownerPath);
@@ -88,8 +87,10 @@ async function acquireMutationLock(path: string): Promise<MutationLock> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
 
   while (true) {
+    let created = false;
     try {
       await mkdir(lockPath, { mode: 0o700 });
+      created = true;
       await writeFile(ownerPath, owner, { encoding: "utf8", flag: "wx", mode: 0o600 });
       const heartbeat = setInterval(() => {
         const beat = new Date();
@@ -112,7 +113,8 @@ async function acquireMutationLock(path: string): Promise<MutationLock> {
         },
       };
     } catch (error) {
-      if (errorCode(error) !== "EEXIST") throw error;
+      if (created && !missing(error)) throw error;
+      if (!created && errorCode(error) !== "EEXIST") throw error;
     }
 
     const signal = await lockSignal(lockPath, ownerPath);
