@@ -35,6 +35,60 @@ describe("CredentialPool", () => {
     expect(pool.select(undefined, 1_010)?.key).toBe("one");
   });
 
+  test("keeps a 401 disabled state across a pool replacement", () => {
+    const pool = new CredentialPool(["one", "two"]);
+    const selected = pool.select()!;
+    pool.replace(["one", "two"]);
+    expect(pool.fail(selected, { status: 401 }, 10)).toBe(true);
+    expect(pool.entries(11).map((entry) => entry.health)).toEqual(["disabled", "ready"]);
+    expect(pool.select(undefined, 11)?.key).toBe("two");
+  });
+
+  test("keeps a 429 cooldown and its retryAt across a pool replacement", () => {
+    const pool = new CredentialPool(["one", "two"]);
+    const selected = pool.select()!;
+    pool.fail(selected, { status: 429, retryAfterMs: 1_000 }, 10);
+    pool.replace(["one", "two"]);
+    expect(pool.entries(11)[0]).toMatchObject({ health: "cooling", retryAt: 1_010 });
+    expect(pool.select(undefined, 11)?.key).toBe("two");
+    expect(pool.select(undefined, 1_010)?.key).toBe("one");
+  });
+
+  test("carries a 429 cooldown by identity when a replacement reorders the keys", () => {
+    const pool = new CredentialPool(["one", "two"]);
+    const selected = pool.select()!;
+    pool.fail(selected, { status: 429, retryAfterMs: 1_000 }, 10);
+    pool.replace(["two", "one"]);
+    expect(pool.entries(11)).toMatchObject([
+      { fingerprint: fingerprint("two"), health: "ready" },
+      { fingerprint: fingerprint("one"), health: "cooling", retryAt: 1_010 },
+    ]);
+    expect(pool.select(undefined, 11)?.key).toBe("two");
+    expect(pool.entries(1_010).map((entry) => entry.health)).toEqual(["ready", "ready"]);
+  });
+
+  test("cools a 429 without Retry-After for the default minute", () => {
+    const pool = new CredentialPool(["one", "two"]);
+    const selected = pool.select()!;
+    pool.fail(selected, { status: 429 }, 10);
+    expect(pool.entries(60_009)[0]?.health).toBe("cooling");
+    expect(pool.select(undefined, 60_009)?.key).toBe("two");
+    expect(pool.entries(60_010)[0]?.health).toBe("ready");
+    expect(pool.select(undefined, 60_010)?.key).toBe("one");
+  });
+
+  test("reset returns disabled and cooling credentials to ready", () => {
+    const pool = new CredentialPool(["one", "two"]);
+    const first = pool.select()!;
+    pool.fail(first, { status: 401 }, 10);
+    const second = pool.select(undefined, 11)!;
+    pool.fail(second, { status: 429, retryAfterMs: 5_000 }, 11);
+    expect(pool.entries(12).map((entry) => entry.health)).toEqual(["disabled", "cooling"]);
+    pool.reset();
+    expect(pool.entries(12)).toMatchObject([{ health: "ready" }, { health: "ready" }]);
+    expect(pool.entries(12).every((entry) => entry.retryAt === undefined)).toBe(true);
+  });
+
   test("exposes fingerprints and parses Retry-After without secrets", () => {
     const pool = new CredentialPool(["super-secret"]);
     expect(pool.entries()[0]).toMatchObject({ fingerprint: fingerprint("super-secret"), health: "ready" });
