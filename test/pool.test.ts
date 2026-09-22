@@ -734,6 +734,42 @@ test("persists a cooldown to the store when a request is rate limited", async ()
 	}
 });
 
+function successSse(): string {
+	return [
+		{ type: "message_start", message: { id: "flush", type: "message", role: "assistant", model: model.id, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0 } } },
+		{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+		{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } },
+		{ type: "content_block_stop", index: 0 },
+		{ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 1 } },
+		{ type: "message_stop" },
+	].map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
+}
+
+// The session, not the test runner, has to survive the rejected flush, so the run
+// happens in its own process and the exit code is what proves it stayed alive.
+test("a health flush the store rejects keeps serving the request and outlives it", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-flush-reject-"));
+	const path = join(home, ".pi", "agent", "credential-pools.json");
+	await writePools({ version: 1, pools: { "opencode-go": ["reject-key-one", "reject-key-two"] } }, path);
+	const session = join(home, "session.ts");
+	await Bun.write(session, [
+		`import credentialPoolExtension from ${JSON.stringify(join(import.meta.dir, "../extensions/pi-credential-pool.ts"))};`,
+		"let provider; let command;",
+		"await credentialPoolExtension({ on: () => undefined, registerProvider: (value) => { provider = value; }, unregisterProvider: () => undefined, registerCommand: (_name, value) => { command = value; } });",
+		"await Bun.write(process.env.STORE, '{ truncated');",
+		"let attempts = 0;",
+		"const output = provider.streamSimple(JSON.parse(process.env.MODEL), { messages: [{ role: 'user', content: 'hi' }] }, { fetch: async () => (attempts++ === 0 ? new Response(null, { status: 429, headers: { 'retry-after': '300' } }) : new Response(process.env.SSE, { status: 200, headers: { 'content-type': 'text/event-stream' } })) });",
+		"const received = []; for await (const event of output) received.push(event);",
+		"const ui = { ui: { input: async () => undefined, select: async () => undefined, notify: () => undefined } };",
+		"await command.handler('reset', ui).catch(() => undefined);",
+		"console.log(received.at(-1)?.type, attempts);",
+	].join("\n"));
+	const child = Bun.spawn(["bun", session], { env: { ...process.env, HOME: home, STORE: path, MODEL: JSON.stringify(model), SSE: successSse() }, stdout: "pipe", stderr: "pipe" });
+	const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+	expect([code, stderr.trim()]).toEqual([0, ""]);
+	expect(stdout.trim()).toBe("done 2");
+});
+
 test("a pool started against a store with health adopts it", async () => {
 	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-store-health-"));
 	const previousHome = process.env.HOME;
