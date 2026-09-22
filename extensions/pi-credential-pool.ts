@@ -7,6 +7,8 @@ import { defaultStorePath, readPools, SerializedPools } from "../src/storage.ts"
 import { fetchUsage, UsageCache, type FetchLike, type UsageReport } from "../src/usage.ts";
 
 const poolName = "opencode-go";
+const usageConcurrency = 4;
+const usageTimeoutMs = 10_000;
 
 export type PoolExtensionDeps = { fetch?: FetchLike; now?: () => number };
 type ProviderStream = (key: string, fetch: typeof globalThis.fetch) => AssistantMessageEventStream;
@@ -127,6 +129,16 @@ export function renderUsage(entry: CredentialEntry, index: number, outcome: Usag
 	return lines.join("\n");
 }
 
+async function usageOutcome(entry: CredentialEntry, key: string, sessionId: string, fetcher: FetchLike, cache: UsageCache, now: () => number): Promise<UsageOutcome> {
+	const fresh = cache.fresh(entry.identity, now());
+	if (fresh) return { report: fresh };
+	const result = await fetchUsage(key, sessionId, fetcher, now(), AbortSignal.timeout(usageTimeoutMs));
+	if (result.kind === "ok") { cache.record(entry.identity, result.report); return { report: result.report }; }
+	if (result.kind === "auth") { cache.clear(entry.identity); return { error: `authentication failed (${result.status})${result.message ? `: ${result.message}` : ""}` }; }
+	const lastGood = cache.lastGood(entry.identity);
+	return lastGood ? { report: lastGood, stale: result.message } : { error: result.message };
+}
+
 export default async function credentialPoolExtension(pi: ExtensionAPI, deps: PoolExtensionDeps = {}): Promise<void> {
 	const path = defaultStorePath();
 	const readStoreMtime = async (): Promise<number | undefined> => (await stat(path).catch(() => undefined))?.mtimeMs;
@@ -184,15 +196,16 @@ export default async function credentialPoolExtension(pi: ExtensionAPI, deps: Po
 				const fetcher = deps.fetch ?? globalThis.fetch;
 				const entries = pool.entries(now());
 				const keys = pool.keys();
-				const outcomes = await Promise.all(entries.map(async (entry, index): Promise<UsageOutcome> => {
-					const fresh = usageCache.fresh(entry.identity, now());
-					if (fresh) return { report: fresh };
-					const result = await fetchUsage(keys[index]!, usageSessionId, fetcher, now());
-					if (result.kind === "ok") { usageCache.record(entry.identity, result.report); return { report: result.report }; }
-					if (result.kind === "auth") { usageCache.clear(entry.identity); return { error: `authentication failed (${result.status})${result.message ? `: ${result.message}` : ""}` }; }
-					const lastGood = usageCache.lastGood(entry.identity);
-					return lastGood ? { report: lastGood, stale: result.message } : { error: result.message };
-				}));
+				const outcomes: UsageOutcome[] = [];
+				let next = 0;
+				const worker = async (): Promise<void> => {
+					while (next < entries.length) {
+						const index = next;
+						next += 1;
+						outcomes[index] = await usageOutcome(entries[index]!, keys[index]!, usageSessionId, fetcher, usageCache, now);
+					}
+				};
+				await Promise.all(Array.from({ length: Math.min(usageConcurrency, entries.length) }, () => worker()));
 				ctx.ui.notify(entries.length ? entries.map((entry, index) => renderUsage(entry, index, outcomes[index]!)).join("\n\n") : "No credentials configured");
 				return;
 			}
