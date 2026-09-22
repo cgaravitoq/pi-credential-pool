@@ -1,3 +1,4 @@
+import { stat } from "node:fs/promises";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type Api, type AssistantMessageEvent, type AssistantMessageEventStream, type Model, type ModelsStoreEntry, type Provider } from "@earendil-works/pi-ai";
 import { builtinProviders, getBuiltinModelDataGeneratedAt } from "@earendil-works/pi-ai/providers/all";
@@ -6,6 +7,8 @@ import { defaultStorePath, readPools, SerializedPools } from "../src/storage.ts"
 import { fetchUsage, UsageCache, type FetchLike, type UsageReport } from "../src/usage.ts";
 
 const poolName = "opencode-go";
+const usageConcurrency = 4;
+const usageTimeoutMs = 10_000;
 
 export type PoolExtensionDeps = { fetch?: FetchLike; now?: () => number };
 type ProviderStream = (key: string, fetch: typeof globalThis.fetch) => AssistantMessageEventStream;
@@ -23,7 +26,7 @@ function failureFrom(response: StreamMetadata, message = ""): Failure {
 }
 
 function errorEvent(model: Model<Api>, error: unknown): Extract<AssistantMessageEvent, { type: "error" }> {
-	return { type: "error", reason: "error", error: { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "error", errorMessage: error instanceof Error ? error.message : "Credential pool failed", timestamp: Date.now() } } as Extract<AssistantMessageEvent, { type: "error" }>;
+	return { type: "error", reason: "error", error: { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "error", errorMessage: error instanceof Error ? error.message : "Credential pool failed", timestamp: Date.now() } };
 }
 
 export function createPooledStream(pool: CredentialPool, sessionId: () => string | undefined, model: Model<Api>, stream: ProviderStream, fetcher: FetchLike = globalThis.fetch): AssistantMessageEventStream {
@@ -126,10 +129,29 @@ export function renderUsage(entry: CredentialEntry, index: number, outcome: Usag
 	return lines.join("\n");
 }
 
+async function usageOutcome(entry: CredentialEntry, key: string, sessionId: string, fetcher: FetchLike, cache: UsageCache, now: () => number): Promise<UsageOutcome> {
+	const fresh = cache.fresh(entry.identity, now());
+	if (fresh) return { report: fresh };
+	const result = await fetchUsage(key, sessionId, fetcher, now(), AbortSignal.timeout(usageTimeoutMs));
+	if (result.kind === "ok") { cache.record(entry.identity, result.report); return { report: result.report }; }
+	if (result.kind === "auth") { cache.clear(entry.identity); return { error: `authentication failed (${result.status})${result.message ? `: ${result.message}` : ""}` }; }
+	const lastGood = cache.lastGood(entry.identity);
+	return lastGood ? { report: lastGood, stale: result.message } : { error: result.message };
+}
+
 export default async function credentialPoolExtension(pi: ExtensionAPI, deps: PoolExtensionDeps = {}): Promise<void> {
 	const path = defaultStorePath();
+	const readStoreMtime = async (): Promise<number | undefined> => (await stat(path).catch(() => undefined))?.mtimeMs;
+	let storeMtimeMs = await readStoreMtime();
 	const stored = await readPools(path);
 	const pool = new CredentialPool(stored.pools[poolName] ?? []);
+	const syncFromStore = async (): Promise<void> => {
+		const mtimeMs = await readStoreMtime();
+		if (mtimeMs === storeMtimeMs) return;
+		storeMtimeMs = mtimeMs;
+		const current = await readPools(path);
+		pool.replace(current.pools[poolName] ?? []);
+	};
 	const builtin = builtinProviders().find((provider) => provider.id === poolName) as GoProvider | undefined;
 	if (!builtin) throw new Error("OpenCode Go provider is unavailable");
 	const catalog: CatalogRef = { current: builtin };
@@ -159,35 +181,45 @@ export default async function credentialPoolExtension(pi: ExtensionAPI, deps: Po
 		// Pi's persisted/remote catalog lives in the provider the runtime already composed.
 		// Restoring it as this provider's base keeps refreshed models selectable.
 		pi.unregisterProvider(poolName);
-		const live = ctx.modelRegistry.getProvider(poolName) as GoProvider | undefined;
-		if (live && live !== provider) { catalog.current = live; restoredCatalog.models = []; pi.registerProvider(provider); }
+		const live = (ctx.modelRegistry.getProvider(poolName) ?? builtin) as GoProvider;
+		catalog.current = live;
+		restoredCatalog.models = [];
+		pi.registerProvider(provider);
 	});
+	pi.on("turn_start", async () => { await syncFromStore(); });
 	pi.registerCommand("credential-pool", {
 		description: "Manage the local OpenCode Go credential pool",
 		handler: async (args, ctx) => {
 			const action = args.trim();
+			await syncFromStore();
 			if (action === "list") { ctx.ui.notify(pool.entries().map((entry) => `${entry.fingerprint} ${entry.health} attempts=${entry.attempts} last-used=${entry.lastUsedAt === undefined ? "never" : formatTime(entry.lastUsedAt)} outcome=${entry.lastOutcome ?? "none"}${entry.lastSelected ? " last-selected" : ""}`).join("\n") || "No credentials configured"); return; }
 			if (action === "usage") {
 				const now = deps.now ?? Date.now;
 				const fetcher = deps.fetch ?? globalThis.fetch;
 				const entries = pool.entries(now());
 				const keys = pool.keys();
-				const outcomes = await Promise.all(entries.map(async (entry, index): Promise<UsageOutcome> => {
-					const fresh = usageCache.fresh(entry.identity, now());
-					if (fresh) return { report: fresh };
-					const result = await fetchUsage(keys[index]!, usageSessionId, fetcher, now());
-					if (result.kind === "ok") { usageCache.record(entry.identity, result.report); return { report: result.report }; }
-					if (result.kind === "auth") { usageCache.clear(entry.identity); return { error: `authentication failed (${result.status})${result.message ? `: ${result.message}` : ""}` }; }
-					const lastGood = usageCache.lastGood(entry.identity);
-					return lastGood ? { report: lastGood, stale: result.message } : { error: result.message };
-				}));
+				const outcomes: UsageOutcome[] = [];
+				let next = 0;
+				const worker = async (): Promise<void> => {
+					while (next < entries.length) {
+						const index = next;
+						next += 1;
+						outcomes[index] = await usageOutcome(entries[index]!, keys[index]!, usageSessionId, fetcher, usageCache, now);
+					}
+				};
+				await Promise.all(Array.from({ length: Math.min(usageConcurrency, entries.length) }, () => worker()));
 				ctx.ui.notify(entries.length ? entries.map((entry, index) => renderUsage(entry, index, outcomes[index]!)).join("\n\n") : "No credentials configured");
 				return;
 			}
 			if (action === "add") {
 				const key = await ctx.ui.input("Add OpenCode Go credential", "Paste a credential");
 				if (!key) return;
-				await mutations.mutate(path, (current) => { const keys = [...(current.pools[poolName] ?? []), key]; new CredentialPool(keys); current.pools[poolName] = keys; pool.replace(keys); });
+				const written = await mutations.mutate(path, (current) => {
+					const existing = current.pools[poolName] ?? [];
+					if (!key.trim() || existing.includes(key)) throw new Error("Credential keys must be distinct and non-empty");
+					current.pools[poolName] = [...existing, key];
+				});
+				pool.replace(written.pools[poolName] ?? []);
 				ctx.ui.notify("Credential added");
 				return;
 			}
@@ -198,12 +230,13 @@ export default async function credentialPoolExtension(pi: ExtensionAPI, deps: Po
 				if (!selected) return;
 				const identity = entries[choices.indexOf(selected)]?.identity;
 				if (!identity) return;
-				await mutations.mutate(path, (current) => { const keys = (current.pools[poolName] ?? []).filter((key) => credentialIdentity(key) !== identity); current.pools[poolName] = keys; pool.replace(keys); });
+				const written = await mutations.mutate(path, (current) => { current.pools[poolName] = (current.pools[poolName] ?? []).filter((key) => credentialIdentity(key) !== identity); });
+				pool.replace(written.pools[poolName] ?? []);
 				ctx.ui.notify("Credential removed");
 				return;
 			}
 			if (action === "reset") {
-				await mutations.mutate(path, (current) => { pool.replace(current.pools[poolName] ?? []); pool.reset(); });
+				pool.reset();
 				ctx.ui.notify("Credential health reset");
 				return;
 			}
