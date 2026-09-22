@@ -2,6 +2,10 @@ import { createHash } from "node:crypto";
 
 export type Health = "ready" | "cooling" | "disabled";
 
+export interface HealthRecord {
+  [identity: string]: { state: Health; retryAt?: number };
+}
+
 export type Credential = {
   key: string;
   fingerprint: string;
@@ -52,13 +56,19 @@ export class CredentialPool {
   #cursor = 0;
   #activity = new Map<string, { attempts: number; lastUsedAt?: number; lastOutcome?: AttemptOutcome }>();
   #lastSelected?: string;
+  #onHealthChange?: (health: HealthRecord) => void;
 
-  constructor(keys: readonly string[]) {
+  constructor(keys: readonly string[], health: HealthRecord = {}, onHealthChange?: (health: HealthRecord) => void) {
+    this.#onHealthChange = onHealthChange;
     const seen = new Set<string>();
     this.#items = keys.map((key) => {
       if (!key.trim() || seen.has(key)) throw new Error("Credential keys must be distinct and non-empty");
       seen.add(key);
-      return { key, fingerprint: fingerprint(key), identity: credentialIdentity(key), health: "ready" };
+      const identity = credentialIdentity(key);
+      const stored = health[identity];
+      const item: Credential = { key, fingerprint: fingerprint(key), identity, health: stored?.state ?? "ready" };
+      if (stored?.retryAt !== undefined) item.retryAt = stored.retryAt;
+      return item;
     });
   }
 
@@ -111,6 +121,7 @@ export class CredentialPool {
       if (target) {
         target.health = "disabled";
         delete target.retryAt;
+        this.#publish(now);
       }
       return true;
     }
@@ -118,30 +129,33 @@ export class CredentialPool {
       if (target) {
         target.health = "cooling";
         target.retryAt = now + (failure.retryAfterMs ?? 60_000);
+        this.#publish(now);
       }
       return true;
     }
     return false;
   }
 
-  reset(): void {
+  healthRecord(now = Date.now()): HealthRecord {
+    this.#wake(now);
+    const record: HealthRecord = {};
     for (const item of this.#items) {
-      item.health = "ready";
-      delete item.retryAt;
+      if (item.health === "disabled") record[item.identity] = { state: "disabled" };
+      else if (item.health === "cooling" && item.retryAt !== undefined) record[item.identity] = { state: "cooling", retryAt: item.retryAt };
     }
+    return record;
   }
 
-  replace(keys: readonly string[]): void {
-    const next = new CredentialPool(keys);
-    const previous = new Map(this.#items.map((item) => [item.identity, item]));
-    this.#items = next.#items.map((item) => {
-      const old = previous.get(item.identity);
-      return old ? { ...item, health: old.health, retryAt: old.retryAt } : item;
-    });
+  replace(keys: readonly string[], health: HealthRecord = {}): void {
+    this.#items = new CredentialPool(keys, health).#items;
     this.#cursor %= Math.max(this.#items.length, 1);
     const identities = new Set(this.#items.map((item) => item.identity));
     for (const identity of this.#activity.keys()) if (!identities.has(identity)) this.#activity.delete(identity);
     if (this.#lastSelected !== undefined && !identities.has(this.#lastSelected)) this.#lastSelected = undefined;
+  }
+
+  #publish(now: number): void {
+    this.#onHealthChange?.(this.healthRecord(now));
   }
 
   #wake(now: number): void {

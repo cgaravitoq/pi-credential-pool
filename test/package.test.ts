@@ -13,6 +13,14 @@ async function run(command: string[], env = process.env) {
   return { stdout, stderr, exitCode };
 }
 
+function gates(source: string): Set<string> {
+  return new Set([...source.matchAll(/bun run ([\w:-]+)/g)].map((match) => match[1]!));
+}
+
+function branchPatterns(source: string): string[] | undefined {
+  return /pull_request:\s*\n\s*branches:\s*\[([^\]]*)\]/.exec(source)?.[1]?.split(",").map((pattern) => pattern.trim().replace(/^["']|["']$/g, ""));
+}
+
 test("the packed tarball ships every declared runtime file", async () => {
   const packed = await run(["npm", "pack", "--dry-run", "--json"]);
   expect(packed.exitCode, packed.stderr).toBe(0);
@@ -23,17 +31,24 @@ test("the packed tarball ships every declared runtime file", async () => {
 });
 
 test("the release workflow runs every gate the CI workflow runs", async () => {
-  const gates = async (name: string) => {
-    const source = await readFile(join(import.meta.dir, "..", ".github", "workflows", name), "utf8");
-    return new Set([...source.matchAll(/run: bun run ([\w:-]+)/g)].map((match) => match[1]!));
-  };
-  const [ci, release] = await Promise.all([gates("ci.yml"), gates("release.yml")]);
-  expect([...ci].filter((gate) => !release.has(gate))).toEqual([]);
+  const workflow = async (name: string) => readFile(join(import.meta.dir, "..", ".github", "workflows", name), "utf8");
+  const [ci, release] = await Promise.all([workflow("ci.yml"), workflow("release.yml")]);
+  expect([...gates(ci)].filter((gate) => !gates(release).has(gate))).toEqual([]);
+});
+
+test("reads gates from inline and block workflow steps", () => {
+  expect([...gates("      - name: Check\n        run: bun run check\n")]).toEqual(["check"]);
+  expect([...gates("      - name: Test\n        run: |\n          bun run test\n")]).toEqual(["test"]);
 });
 
 test("the CI workflow covers pull requests into base branches containing a slash", async () => {
   const source = await readFile(join(import.meta.dir, "..", ".github", "workflows", "ci.yml"), "utf8");
-  expect(/pull_request:\s*\n\s*branches:\s*\[([^\]]+)\]/.exec(source)?.[1]).toContain('"**"');
+  expect(branchPatterns(source)).toEqual(["**"]);
+});
+
+test("reads branch filters as whole patterns instead of a substring", () => {
+  expect(branchPatterns('  pull_request:\n    branches: ["**"]\n')).toEqual(["**"]);
+  expect(branchPatterns('  pull_request:\n    branches: ["no**pe"]\n')).not.toEqual(["**"]);
 });
 
 test("the packed extension loads in Pi without package-local peer dependencies", async () => {

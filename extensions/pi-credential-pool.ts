@@ -2,7 +2,7 @@ import { stat } from "node:fs/promises";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type Api, type AssistantMessageEvent, type AssistantMessageEventStream, type Model, type ModelsStoreEntry, type Provider } from "@earendil-works/pi-ai";
 import { builtinProviders, getBuiltinModelDataGeneratedAt } from "@earendil-works/pi-ai/providers/all";
-import { attemptOutcome, credentialIdentity, CredentialPool, retryAfterMs, type CredentialEntry, type Failure } from "../src/pool.ts";
+import { attemptOutcome, credentialIdentity, CredentialPool, retryAfterMs, type CredentialEntry, type Failure, type HealthRecord } from "../src/pool.ts";
 import { defaultStorePath, readPools, SerializedPools } from "../src/storage.ts";
 import { fetchUsage, UsageCache, type FetchLike, type UsageReport } from "../src/usage.ts";
 
@@ -143,21 +143,24 @@ export default async function credentialPoolExtension(pi: ExtensionAPI, deps: Po
 	const path = defaultStorePath();
 	const readStoreMtime = async (): Promise<number | undefined> => (await stat(path).catch(() => undefined))?.mtimeMs;
 	let storeMtimeMs = await readStoreMtime();
+	const mutations = new SerializedPools();
 	const stored = await readPools(path);
-	const pool = new CredentialPool(stored.pools[poolName] ?? []);
+	const flushHealth = (health: HealthRecord): void => {
+		void mutations.mutate(path, (current) => { current.health = { ...current.health, ...health }; }).catch(() => undefined);
+	};
+	const pool = new CredentialPool(stored.pools[poolName] ?? [], stored.health ?? {}, flushHealth);
 	const syncFromStore = async (): Promise<void> => {
 		const mtimeMs = await readStoreMtime();
 		if (mtimeMs === storeMtimeMs) return;
 		storeMtimeMs = mtimeMs;
 		const current = await readPools(path);
-		pool.replace(current.pools[poolName] ?? []);
+		pool.replace(current.pools[poolName] ?? [], current.health ?? {});
 	};
 	const builtin = builtinProviders().find((provider) => provider.id === poolName) as GoProvider | undefined;
 	if (!builtin) throw new Error("OpenCode Go provider is unavailable");
 	const catalog: CatalogRef = { current: builtin };
 	const restoredCatalog: RestoredModelRef = { models: [] };
 	const builtinGeneratedAt = getBuiltinModelDataGeneratedAt();
-	const mutations = new SerializedPools();
 	const usageCache = new UsageCache();
 	const usageSessionId = crypto.randomUUID();
 	let activeSessionId: string | undefined;
@@ -219,7 +222,7 @@ export default async function credentialPoolExtension(pi: ExtensionAPI, deps: Po
 					if (!key.trim() || existing.includes(key)) throw new Error("Credential keys must be distinct and non-empty");
 					current.pools[poolName] = [...existing, key];
 				});
-				pool.replace(written.pools[poolName] ?? []);
+				pool.replace(written.pools[poolName] ?? [], written.health ?? {});
 				ctx.ui.notify("Credential added");
 				return;
 			}
@@ -230,13 +233,24 @@ export default async function credentialPoolExtension(pi: ExtensionAPI, deps: Po
 				if (!selected) return;
 				const identity = entries[choices.indexOf(selected)]?.identity;
 				if (!identity) return;
-				const written = await mutations.mutate(path, (current) => { current.pools[poolName] = (current.pools[poolName] ?? []).filter((key) => credentialIdentity(key) !== identity); });
-				pool.replace(written.pools[poolName] ?? []);
+				const written = await mutations.mutate(path, (current) => {
+					current.pools[poolName] = (current.pools[poolName] ?? []).filter((key) => credentialIdentity(key) !== identity);
+					const health = current.health ?? {};
+					delete health[identity];
+					current.health = health;
+				});
+				pool.replace(written.pools[poolName] ?? [], written.health ?? {});
 				ctx.ui.notify("Credential removed");
 				return;
 			}
 			if (action === "reset") {
-				pool.reset();
+				const written = await mutations.mutate(path, (current) => {
+					const identities = new Set((current.pools[poolName] ?? []).map(credentialIdentity));
+					const health = current.health ?? {};
+					for (const candidate of Object.keys(health)) if (identities.has(candidate)) delete health[candidate];
+					current.health = health;
+				});
+				pool.replace(written.pools[poolName] ?? [], written.health ?? {});
 				ctx.ui.notify("Credential health reset");
 				return;
 			}

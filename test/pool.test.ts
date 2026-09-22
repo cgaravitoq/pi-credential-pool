@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
-import { CredentialPool, credentialIdentity, fingerprint, retryAfterMs } from "../src/pool.ts";
+import { CredentialPool, credentialIdentity, fingerprint, retryAfterMs, type HealthRecord } from "../src/pool.ts";
 import { readPools, SerializedPools, writePools } from "../src/storage.ts";
 import { createPooledStream } from "../extensions/pi-credential-pool.ts";
 import credentialPoolExtension from "../extensions/pi-credential-pool.ts";
@@ -38,33 +38,46 @@ describe("CredentialPool", () => {
   test("keeps a 401 disabled state across a pool replacement", () => {
     const pool = new CredentialPool(["one", "two"]);
     const selected = pool.select()!;
-    pool.replace(["one", "two"]);
+    pool.replace(["one", "two"], {});
     expect(pool.fail(selected, { status: 401 }, 10)).toBe(true);
     expect(pool.entries(11).map((entry) => entry.health)).toEqual(["disabled", "ready"]);
     expect(pool.select(undefined, 11)?.key).toBe("two");
   });
 
-  test("keeps a 429 cooldown and its retryAt across a pool replacement", () => {
+  test("applies stored health across a pool replacement", () => {
     const pool = new CredentialPool(["one", "two"]);
-    const selected = pool.select()!;
-    pool.fail(selected, { status: 429, retryAfterMs: 1_000 }, 10);
-    pool.replace(["one", "two"]);
-    expect(pool.entries(11)[0]).toMatchObject({ health: "cooling", retryAt: 1_010 });
+    pool.fail(pool.select()!, { status: 429, retryAfterMs: 1_000 }, 10);
+    pool.replace(["one", "two"], { [credentialIdentity("one")]: { state: "cooling", retryAt: 5_000 } });
+    expect(pool.entries(11)[0]).toMatchObject({ health: "cooling", retryAt: 5_000 });
     expect(pool.select(undefined, 11)?.key).toBe("two");
-    expect(pool.select(undefined, 1_010)?.key).toBe("one");
+    expect(pool.select(undefined, 5_000)?.key).toBe("one");
+    pool.replace(["one", "two"], {});
+    expect(pool.entries(11).map((entry) => entry.health)).toEqual(["ready", "ready"]);
   });
 
-  test("carries a 429 cooldown by identity when a replacement reorders the keys", () => {
+  test("applies stored health by identity when a replacement reorders the keys", () => {
     const pool = new CredentialPool(["one", "two"]);
-    const selected = pool.select()!;
-    pool.fail(selected, { status: 429, retryAfterMs: 1_000 }, 10);
-    pool.replace(["two", "one"]);
+    pool.replace(["two", "one"], { [credentialIdentity("one")]: { state: "cooling", retryAt: 1_010 } });
     expect(pool.entries(11)).toMatchObject([
       { fingerprint: fingerprint("two"), health: "ready" },
       { fingerprint: fingerprint("one"), health: "cooling", retryAt: 1_010 },
     ]);
     expect(pool.select(undefined, 11)?.key).toBe("two");
     expect(pool.entries(1_010).map((entry) => entry.health)).toEqual(["ready", "ready"]);
+  });
+
+  test("starts a fresh pool from stored cooling and disabled health", () => {
+    const pool = new CredentialPool(["one", "two", "three"], {
+      [credentialIdentity("one")]: { state: "cooling", retryAt: 5_000 },
+      [credentialIdentity("two")]: { state: "disabled" },
+    });
+    expect(pool.entries(11)).toMatchObject([
+      { fingerprint: fingerprint("one"), health: "cooling", retryAt: 5_000 },
+      { fingerprint: fingerprint("two"), health: "disabled" },
+      { fingerprint: fingerprint("three"), health: "ready" },
+    ]);
+    expect(pool.select(undefined, 11)?.key).toBe("three");
+    expect(pool.select(undefined, 5_000)?.key).toBe("one");
   });
 
   test("cools a 429 without Retry-After for the default minute", () => {
@@ -77,16 +90,38 @@ describe("CredentialPool", () => {
     expect(pool.select(undefined, 60_010)?.key).toBe("one");
   });
 
-  test("reset returns disabled and cooling credentials to ready", () => {
+  test("clearing health through a replacement returns disabled and cooling credentials to ready", () => {
     const pool = new CredentialPool(["one", "two"]);
     const first = pool.select()!;
     pool.fail(first, { status: 401 }, 10);
     const second = pool.select(undefined, 11)!;
     pool.fail(second, { status: 429, retryAfterMs: 5_000 }, 11);
     expect(pool.entries(12).map((entry) => entry.health)).toEqual(["disabled", "cooling"]);
-    pool.reset();
+    pool.replace(["one", "two"], {});
     expect(pool.entries(12)).toMatchObject([{ health: "ready" }, { health: "ready" }]);
     expect(pool.entries(12).every((entry) => entry.retryAt === undefined)).toBe(true);
+  });
+
+  test("snapshots cooling and disabled health without an expired cooldown", () => {
+    const pool = new CredentialPool(["one", "two"]);
+    pool.fail(pool.select(undefined, 10)!, { status: 429, retryAfterMs: 1_000 }, 10);
+    pool.fail(pool.select(undefined, 10)!, { status: 401 }, 10);
+    expect(pool.healthRecord(11)).toEqual({
+      [credentialIdentity("one")]: { state: "cooling", retryAt: 1_010 },
+      [credentialIdentity("two")]: { state: "disabled" },
+    });
+    expect(pool.healthRecord(1_010)).toEqual({ [credentialIdentity("two")]: { state: "disabled" } });
+  });
+
+  test("publishes each health change to its listener", () => {
+    const published: HealthRecord[] = [];
+    const pool = new CredentialPool(["one", "two"], {}, (health) => published.push(health));
+    pool.fail(pool.select(undefined, 10)!, { status: 429, retryAfterMs: 1_000 }, 10);
+    pool.fail(pool.select(undefined, 10)!, { status: 401 }, 10);
+    expect(published).toEqual([
+      { [credentialIdentity("one")]: { state: "cooling", retryAt: 1_010 } },
+      { [credentialIdentity("one")]: { state: "cooling", retryAt: 1_010 }, [credentialIdentity("two")]: { state: "disabled" } },
+    ]);
   });
 
   test("exposes fingerprints and parses Retry-After without secrets", () => {
@@ -103,6 +138,33 @@ test("stores credentials atomically with 0600 permissions", async () => {
   await writePools({ version: 1, pools: { "opencode-go": ["secret"] } }, path);
   expect((await stat(path)).mode & 0o777).toBe(0o600);
   expect(await readPools(path)).toEqual({ version: 1, pools: { "opencode-go": ["secret"] } });
+});
+
+test("reads a v1 store written before health was stored and writes health back as v1", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-credential-pool-v1-"));
+  const path = join(directory, "credential-pools.json");
+  await writeFile(path, JSON.stringify({ version: 1, pools: { "opencode-go": ["legacy"] } }));
+  expect(await readPools(path)).toEqual({ version: 1, pools: { "opencode-go": ["legacy"] } });
+  await new SerializedPools().mutate(path, (stored) => { stored.health = { [credentialIdentity("legacy")]: { state: "disabled" } }; });
+  const raw = JSON.parse(await readFile(path, "utf8"));
+  expect(raw.version).toBe(1);
+  expect(raw.pools["opencode-go"]).toEqual(["legacy"]);
+  expect(raw.health).toEqual({ [credentialIdentity("legacy")]: { state: "disabled" } });
+});
+
+test("drops a malformed health map without losing keys", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-credential-pool-health-shape-"));
+  const path = join(directory, "credential-pools.json");
+  await writeFile(path, JSON.stringify({ version: 1, pools: { "opencode-go": ["kept"] }, health: { [credentialIdentity("kept")]: { state: "melting" }, orphan: "nonsense" } }));
+  expect(await readPools(path)).toEqual({ version: 1, pools: { "opencode-go": ["kept"] } });
+});
+
+test("keeps an empty health map out of the store", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-credential-pool-health-empty-"));
+  const path = join(directory, "credential-pools.json");
+  await new SerializedPools().mutate(path, (stored) => { stored.health = { [credentialIdentity("one")]: { state: "disabled" } }; });
+  await new SerializedPools().mutate(path, (stored) => { stored.health = {}; });
+  expect(JSON.parse(await readFile(path, "utf8"))).toEqual({ version: 1, pools: {} });
 });
 
 test("serializes mutations from independent pools", async () => {
@@ -569,7 +631,40 @@ async function routedKeys(provider: any): Promise<string[]> {
 
 async function expectPoolMirrorsStore(provider: any, path: string): Promise<void> {
 	const stored = (await readPools(path)).pools["opencode-go"] ?? [];
-	expect([...await routedKeys(provider)].sort()).toEqual([...stored].sort());
+	const routed = [...await routedKeys(provider)].sort();
+	expect(routed).toEqual([...stored].sort());
+	const identities = routed.map(credentialIdentity);
+	const states = async () => {
+		const health = (await readPools(path)).health ?? {};
+		return identities.map((identity) => health[identity]?.state);
+	};
+	const deadline = Date.now() + 2_000;
+	while ((await states()).some((state) => state !== "disabled") && Date.now() < deadline) await Bun.sleep(10);
+	expect(await states()).toEqual(identities.map(() => "disabled"));
+}
+
+async function listing(session: Awaited<ReturnType<typeof loadExtension>>): Promise<string> {
+	const notifications: string[] = [];
+	await session.command.handler("list", { ui: { notify: (message: string) => notifications.push(message), input: async () => undefined, select: async () => undefined } });
+	return notifications.join("\n");
+}
+
+async function rateLimited(provider: any, retryAfter = "300"): Promise<void> {
+	const model = opencodeGoProvider().getModels()[0]!;
+	const output = provider.streamSimple(model, { messages: [{ role: "user", content: "hi" }] }, {
+		fetch: async () => new Response(null, { status: 429, headers: { "retry-after": retryAfter } }),
+	});
+	for await (const _event of output) { /* drain */ }
+}
+
+async function waitForHealth(path: string, matches: (health: HealthRecord) => boolean): Promise<HealthRecord> {
+	const deadline = Date.now() + 2_000;
+	let health = (await readPools(path)).health ?? {};
+	while (!matches(health) && Date.now() < deadline) {
+		await Bun.sleep(10);
+		health = (await readPools(path)).health ?? {};
+	}
+	return health;
 }
 
 test("re-reads the store on turn start so a key removed elsewhere stops routing", async () => {
@@ -591,6 +686,165 @@ test("re-reads the store on turn start so a key removed elsewhere stops routing"
 		const used = await routedKeys(second.provider);
 		expect(used).not.toContain(poolKeys[1]);
 		expect(used).toEqual([poolKeys[0], poolKeys[2]]);
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
+});
+
+test("a v1 store written before health was stored still loads and routes", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-v1-load-"));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	const directory = join(home, ".pi", "agent");
+	const path = join(directory, "credential-pools.json");
+	await mkdir(directory, { recursive: true });
+	await writeFile(path, JSON.stringify({ version: 1, pools: { "opencode-go": ["legacy-key"] } }));
+	try {
+		const session = await loadExtension();
+		expect(await routedKeys(session.provider)).toEqual(["legacy-key"]);
+		const health = await waitForHealth(path, (value) => Object.keys(value).length === 1);
+		expect(Object.values(health).map((entry) => entry.state)).toEqual(["disabled"]);
+		const raw = JSON.parse(await readFile(path, "utf8"));
+		expect(raw.version).toBe(1);
+		expect(raw.pools["opencode-go"]).toEqual(["legacy-key"]);
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
+});
+
+test("persists a cooldown to the store when a request is rate limited", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-flush-"));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	const path = join(home, ".pi", "agent", "credential-pools.json");
+	const poolKeys = ["flush-key"];
+	await writePools({ version: 1, pools: { "opencode-go": poolKeys } }, path);
+	try {
+		const session = await loadExtension();
+		await rateLimited(session.provider);
+		const health = await waitForHealth(path, (value) => Object.keys(value).length === poolKeys.length);
+		expect(health).toEqual({ [credentialIdentity(poolKeys[0]!)]: { state: "cooling", retryAt: expect.any(Number) } });
+		expect((await readPools(path)).pools["opencode-go"]).toEqual(poolKeys);
+		expect(JSON.parse(await readFile(path, "utf8")).version).toBe(1);
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
+});
+
+function successSse(): string {
+	return [
+		{ type: "message_start", message: { id: "flush", type: "message", role: "assistant", model: model.id, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0 } } },
+		{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+		{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } },
+		{ type: "content_block_stop", index: 0 },
+		{ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 1 } },
+		{ type: "message_stop" },
+	].map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
+}
+
+// The session, not the test runner, has to survive the rejected flush, so the run
+// happens in its own process and the exit code is what proves it stayed alive.
+test("a health flush the store rejects keeps serving the request and outlives it", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-flush-reject-"));
+	const path = join(home, ".pi", "agent", "credential-pools.json");
+	await writePools({ version: 1, pools: { "opencode-go": ["reject-key-one", "reject-key-two"] } }, path);
+	const session = join(home, "session.ts");
+	await Bun.write(session, [
+		`import credentialPoolExtension from ${JSON.stringify(join(import.meta.dir, "../extensions/pi-credential-pool.ts"))};`,
+		"let provider; let command;",
+		"await credentialPoolExtension({ on: () => undefined, registerProvider: (value) => { provider = value; }, unregisterProvider: () => undefined, registerCommand: (_name, value) => { command = value; } });",
+		"await Bun.write(process.env.STORE, '{ truncated');",
+		"let attempts = 0;",
+		"const output = provider.streamSimple(JSON.parse(process.env.MODEL), { messages: [{ role: 'user', content: 'hi' }] }, { fetch: async () => (attempts++ === 0 ? new Response(null, { status: 429, headers: { 'retry-after': '300' } }) : new Response(process.env.SSE, { status: 200, headers: { 'content-type': 'text/event-stream' } })) });",
+		"const received = []; for await (const event of output) received.push(event);",
+		"const ui = { ui: { input: async () => undefined, select: async () => undefined, notify: () => undefined } };",
+		"await command.handler('reset', ui).catch(() => undefined);",
+		"console.log(received.at(-1)?.type, attempts);",
+	].join("\n"));
+	const child = Bun.spawn(["bun", session], { env: { ...process.env, HOME: home, STORE: path, MODEL: JSON.stringify(model), SSE: successSse() }, stdout: "pipe", stderr: "pipe" });
+	const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+	expect([code, stderr.trim()]).toEqual([0, ""]);
+	expect(stdout.trim()).toBe("done 2");
+});
+
+test("a pool started against a store with health adopts it", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-store-health-"));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	const path = join(home, ".pi", "agent", "credential-pools.json");
+	const poolKeys = ["cool-key", "dead-key", "live-key"];
+	await writePools({ version: 1, pools: { "opencode-go": poolKeys }, health: { [credentialIdentity(poolKeys[0]!)]: { state: "cooling", retryAt: Date.now() + 300_000 }, [credentialIdentity(poolKeys[1]!)]: { state: "disabled" } } }, path);
+	try {
+		const session = await loadExtension();
+		expect(await routedKeys(session.provider)).toEqual([poolKeys[2]]);
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
+});
+
+test("two sessions over one store share a cooldown", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-shared-"));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	const path = join(home, ".pi", "agent", "credential-pools.json");
+	const poolKeys = ["shared-key-one", "shared-key-two"];
+	await writePools({ version: 1, pools: { "opencode-go": poolKeys } }, path);
+	try {
+		const first = await loadExtension();
+		const second = await loadExtension();
+		await rateLimited(first.provider);
+		const health = await waitForHealth(path, (value) => Object.keys(value).length === poolKeys.length);
+		expect(Object.keys(health).sort()).toEqual(poolKeys.map(credentialIdentity).sort());
+		expect(await listing(second)).toContain("cooling");
+		expect(await routedKeys(second.provider)).toEqual([]);
+		expect(await listing(first)).toContain("cooling");
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
+});
+
+test("reset clears the shared health every session sees", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-reset-"));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	const path = join(home, ".pi", "agent", "credential-pools.json");
+	const poolKeys = ["reset-key-one", "reset-key-two"];
+	await writePools({ version: 1, pools: { "opencode-go": poolKeys } }, path);
+	try {
+		const first = await loadExtension();
+		await rateLimited(first.provider);
+		await waitForHealth(path, (value) => Object.keys(value).length === poolKeys.length);
+		const second = await loadExtension();
+		await second.command.handler("reset", { ui: { input: async () => undefined, select: async () => undefined, notify: () => undefined } });
+		expect((await readPools(path)).health).toBeUndefined();
+		expect(await listing(first)).not.toContain("cooling");
+		expect(await listing(await loadExtension())).not.toContain("cooling");
+		expect([...await routedKeys(first.provider)].sort()).toEqual([...poolKeys].sort());
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
+});
+
+test("a re-added credential does not inherit the health of the removed one", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-readd-"));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	const path = join(home, ".pi", "agent", "credential-pools.json");
+	const key = "dead-key";
+	await writePools({ version: 1, pools: { "opencode-go": [key] }, health: { [credentialIdentity(key)]: { state: "disabled" } } }, path);
+	try {
+		const session = await loadExtension();
+		const choice = `${fingerprint(key)} (${credentialIdentity(key).slice(-8)})`;
+		await session.command.handler("remove", { ui: { select: async () => choice, input: async () => undefined, notify: () => undefined } });
+		expect((await readPools(path)).health).toBeUndefined();
+		await session.command.handler("add", { ui: { input: async () => key, select: async () => undefined, notify: () => undefined } });
+		expect(await routedKeys(session.provider)).toEqual([key]);
 	} finally {
 		if (previousHome === undefined) delete process.env.HOME;
 		else process.env.HOME = previousHome;

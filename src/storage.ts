@@ -1,8 +1,9 @@
 import { mkdir, readFile, rename, rm, rmdir, stat, utimes, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
+import type { HealthRecord } from "./pool.ts";
 
-export type StoredPools = { version: 1; pools: Record<string, string[]> };
+export type StoredPools = { version: 1; pools: Record<string, string[]>; health?: HealthRecord };
 
 const empty = (): StoredPools => ({ version: 1, pools: {} });
 const lockWaitMs = 5_000;
@@ -133,6 +134,18 @@ export function defaultStorePath(home = process.env.HOME ?? process.env.USERPROF
   return join(home, ".pi", "agent", "credential-pools.json");
 }
 
+function parseHealth(value: unknown): HealthRecord {
+  const health: HealthRecord = {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) return health;
+  for (const [identity, entry] of Object.entries(value)) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const { state, retryAt } = entry as { state?: unknown; retryAt?: unknown };
+    if (state === "disabled") health[identity] = { state };
+    else if (state === "cooling" && typeof retryAt === "number" && Number.isFinite(retryAt)) health[identity] = { state, retryAt };
+  }
+  return health;
+}
+
 export async function readPools(path = defaultStorePath()): Promise<StoredPools> {
   try {
     const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
@@ -140,7 +153,10 @@ export async function readPools(path = defaultStorePath()): Promise<StoredPools>
     const pools = (parsed as { pools?: unknown }).pools;
     if (!pools || typeof pools !== "object" || Array.isArray(pools)) throw new Error("Invalid credential pool store");
     for (const keys of Object.values(pools)) if (!Array.isArray(keys) || keys.some((key) => typeof key !== "string")) throw new Error("Invalid credential pool store");
-    return parsed as StoredPools;
+    const stored: StoredPools = { version: 1, pools: pools as Record<string, string[]> };
+    const health = parseHealth((parsed as { health?: unknown }).health);
+    if (Object.keys(health).length) stored.health = health;
+    return stored;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return empty();
     throw error;
@@ -164,6 +180,7 @@ export class SerializedPools {
       try {
         const pools = await readPools(path);
         await change(pools);
+        if (pools.health && Object.keys(pools.health).length === 0) delete pools.health;
         await lock.assertOwned();
         await writePools(pools, path);
         return pools;
