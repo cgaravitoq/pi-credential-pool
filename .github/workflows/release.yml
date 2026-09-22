@@ -39,6 +39,9 @@ jobs:
       - name: TypeScript check
         run: bun run check
 
+      - name: Lint anti-slop (oxlint)
+        run: bun run lint:slop
+
       - name: Test
         run: bun run test
 
