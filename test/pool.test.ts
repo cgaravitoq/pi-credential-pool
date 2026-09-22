@@ -147,17 +147,66 @@ test("never detaches the lock a waiter can grab while an owner is inside its cri
   expect(await readPools(path)).toEqual({ version: 1, pools: { keys: ["key-199"] } });
 }, 60_000);
 
+test("waits for a paused live holder instead of taking its lock over", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-credential-pool-"));
+  const path = join(directory, "credential-pools.json");
+  const lockPath = `${path}.lock`;
+  let startHolder!: () => void;
+  let releaseHolder!: () => void;
+  const holderStarted = new Promise<void>((resolve) => { startHolder = resolve; });
+  const holderReleased = new Promise<void>((resolve) => { releaseHolder = resolve; });
+
+  const holder = new SerializedPools().mutate(path, async (pools) => {
+    startHolder();
+    await holderReleased;
+    pools.pools.holder = ["holder"];
+  });
+  await holderStarted;
+  const paused = new Date(Date.now() - 31_000);
+  await utimes(join(lockPath, "owner"), paused, paused);
+  await utimes(lockPath, paused, paused);
+
+  let entered = false;
+  const waiter = new SerializedPools().mutate(path, (pools) => {
+    entered = true;
+    pools.pools.waiter = ["waiter"];
+  });
+  await Bun.sleep(3_000);
+  expect(entered).toBe(false);
+
+  releaseHolder();
+  await Promise.all([holder, waiter]);
+  expect(await readPools(path)).toEqual({ version: 1, pools: { holder: ["holder"], waiter: ["waiter"] } });
+}, 20_000);
+
 test("recovers an ownerless lock a crashed holder left behind", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-credential-pool-"));
   const path = join(directory, "credential-pools.json");
   const lockPath = `${path}.lock`;
   await mkdir(lockPath, { mode: 0o700 });
-  const crashed = new Date(Date.now() - 23_000);
+  const crashed = new Date(Date.now() - 31_000);
   await utimes(lockPath, crashed, crashed);
 
   await new SerializedPools().mutate(path, (pools) => { pools.pools.recovered = ["key"]; });
   expect(await readPools(path)).toEqual({ version: 1, pools: { recovered: ["key"] } });
 }, 15_000);
+
+test("waits out a holder that fell silent instead of timing out", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-credential-pool-"));
+  const path = join(directory, "credential-pools.json");
+  const lockPath = `${path}.lock`;
+  await mkdir(lockPath, { mode: 0o700 });
+  await writeFile(join(lockPath, "owner"), "crashed", { mode: 0o600 });
+  const silent = new Date(Date.now() - 23_000);
+  await utimes(join(lockPath, "owner"), silent, silent);
+  await utimes(lockPath, silent, silent);
+
+  const started = Date.now();
+  await new SerializedPools().mutate(path, (pools) => { pools.pools.recovered = ["key"]; });
+
+  expect(Date.now() - started).toBeGreaterThan(5_000);
+  expect(await readPools(path)).toEqual({ version: 1, pools: { recovered: ["key"] } });
+}, 30_000);
 
 test("paces the waiting recoverer instead of spinning on one core", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-credential-pool-"));
@@ -168,6 +217,7 @@ test("paces the waiting recoverer instead of spinning on one core", async () => 
   await writeFile(join(lockPath, "owner"), "abandoned", { mode: 0o600 });
   await writeFile(recoveryPath, "other", { mode: 0o600 });
   const stale = new Date(Date.now() - 31_000);
+  await utimes(join(lockPath, "owner"), stale, stale);
   await utimes(lockPath, stale, stale);
 
   const before = process.cpuUsage();
