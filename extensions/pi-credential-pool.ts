@@ -13,10 +13,6 @@ type StreamMetadata = { status?: number; retryAfterMs?: number };
 type CatalogRef = { current: GoProvider };
 type RestoredModelRef = { models: readonly Model<GoApi>[] };
 
-function isVisible(event: AssistantMessageEvent): boolean {
-	return event.type === "text_start" || event.type === "text_delta" || event.type === "thinking_start" || event.type === "thinking_delta" || event.type === "toolcall_start" || event.type === "toolcall_delta";
-}
-
 function statusFrom(message: string): number | undefined {
 	const match = message.match(/\b(401|403|429)\b/);
 	return match ? Number(match[1]) : undefined;
@@ -35,25 +31,24 @@ export function createPooledStream(pool: CredentialPool, sessionId: () => string
 	void (async () => {
 		const attempted = new Set<string>();
 		let finalFailure: AssistantMessageEvent | undefined;
-		while (attempted.size < pool.size) {
+		while (attempted.size < Math.min(pool.size, 3)) {
 			const at = Date.now();
 			const credential = pool.select(sessionId(), at, attempted);
 			if (!credential) break;
 			attempted.add(credential.identity);
 			pool.markAttempt(credential, at);
-			let visible = false;
+			let forwarded = false;
 			let response: StreamMetadata = {};
 			const trackedFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 				const result = await fetcher(input, init);
-				response = { status: result.status, retryAfterMs: retryAfterMs(result.headers.get("retry-after")) };
+				if (result.status >= 400) response = { status: result.status, retryAfterMs: retryAfterMs(result.headers.get("retry-after")) };
 				return result;
 			}) as typeof globalThis.fetch;
 			try {
 				const input = stream(credential.key, trackedFetch);
 				let rotate = false;
 				for await (const event of input) {
-					visible ||= isVisible(event);
-					if (event.type === "error" && !visible) {
+					if (event.type === "error" && !forwarded) {
 						const failure = event.error;
 						const attempt = failureFrom(response, failure.errorMessage);
 						if (pool.fail(credential, attempt)) {
@@ -65,6 +60,7 @@ export function createPooledStream(pool: CredentialPool, sessionId: () => string
 					}
 					if (event.type === "done") pool.markOutcome(credential, "ok");
 					else if (event.type === "error") pool.markOutcome(credential, "error");
+					forwarded = true;
 					output.push(event);
 					if (event.type === "done" || event.type === "error") return;
 				}
@@ -75,7 +71,7 @@ export function createPooledStream(pool: CredentialPool, sessionId: () => string
 			} catch (error) {
 				const failure = errorEvent(model, error);
 				const attempt = failureFrom(response, failure.error.errorMessage);
-				if (!visible && pool.fail(credential, attempt)) {
+				if (!forwarded && pool.fail(credential, attempt)) {
 					pool.markOutcome(credential, attemptOutcome(attempt));
 					finalFailure = failure;
 					continue;
