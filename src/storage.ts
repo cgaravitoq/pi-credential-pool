@@ -1,4 +1,4 @@
-import { chmod, mkdir, readFile, rename, rm, rmdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, rmdir, stat, utimes, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -7,71 +7,125 @@ export type StoredPools = { version: 1; pools: Record<string, string[]> };
 const empty = (): StoredPools => ({ version: 1, pools: {} });
 const lockWaitMs = 5_000;
 const staleLockMs = 30_000;
+const heartbeatMs = 1_000;
+const recoveryConfirmMs = 2_000;
+const pollMs = 10;
+
+type LockSignal = { mtimeMs: number; owned: boolean };
+type MutationLock = { assertOwned: () => Promise<void>; release: () => Promise<void> };
 
 const sleep = (milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+const errorCode = (error: unknown) => (error as NodeJS.ErrnoException).code;
+const missing = (error: unknown) => errorCode(error) === "ENOENT";
 
-async function acquireMutationLock(path: string): Promise<() => Promise<void>> {
+async function readIfPresent(target: string): Promise<string | undefined> {
+  try {
+    return await readFile(target, "utf8");
+  } catch (error) {
+    if (missing(error)) return undefined;
+    throw error;
+  }
+}
+
+const ownedBy = async (ownerPath: string, owner: string) => await readIfPresent(ownerPath) === owner;
+
+async function mtimeOf(target: string): Promise<number | undefined> {
+  try {
+    return (await stat(target)).mtimeMs;
+  } catch (error) {
+    if (missing(error)) return undefined;
+    throw error;
+  }
+}
+
+async function lockSignal(lockPath: string, ownerPath: string): Promise<LockSignal | undefined> {
+  const owned = await mtimeOf(ownerPath);
+  if (owned !== undefined) return { mtimeMs: owned, owned: true };
+  const created = await mtimeOf(lockPath);
+  return created === undefined ? undefined : { mtimeMs: created, owned: false };
+}
+
+async function dropRecovery(recoveryPath: string, recovery: string): Promise<void> {
+  if (await readIfPresent(recoveryPath) === recovery) await rm(recoveryPath, { force: true });
+}
+
+async function recoverStaleLock(lockPath: string, ownerPath: string, recoveryPath: string, signal: LockSignal): Promise<void> {
+  const recovery = randomUUID();
+  try {
+    await writeFile(recoveryPath, recovery, { encoding: "utf8", flag: "wx", mode: 0o600 });
+  } catch (error) {
+    if (missing(error)) return;
+    if (errorCode(error) !== "EEXIST") throw error;
+    const claimed = await mtimeOf(recoveryPath);
+    if (claimed !== undefined && Date.now() - claimed > recoveryConfirmMs + lockWaitMs) await rm(recoveryPath, { force: true });
+    return;
+  }
+  if (await readIfPresent(recoveryPath) !== recovery) return;
+  if (signal.owned) {
+    await sleep(recoveryConfirmMs);
+    const current = await lockSignal(lockPath, ownerPath);
+    if (current?.owned !== true || current.mtimeMs !== signal.mtimeMs) {
+      await dropRecovery(recoveryPath, recovery);
+      return;
+    }
+  }
+  await rm(ownerPath, { force: true });
+  await dropRecovery(recoveryPath, recovery);
+  try {
+    await rmdir(lockPath);
+  } catch (error) {
+    if (!missing(error) && errorCode(error) !== "ENOTEMPTY") throw error;
+  }
+}
+
+async function acquireMutationLock(path: string): Promise<MutationLock> {
   const lockPath = `${path}.lock`;
   const ownerPath = join(lockPath, "owner");
   const recoveryPath = join(lockPath, "recovery");
   const owner = randomUUID();
-  const deadline = Date.now() + lockWaitMs;
+  const deadline = Date.now() + lockWaitMs + staleLockMs + recoveryConfirmMs;
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
 
   while (true) {
+    let created = false;
     try {
       await mkdir(lockPath, { mode: 0o700 });
+      created = true;
       await writeFile(ownerPath, owner, { encoding: "utf8", flag: "wx", mode: 0o600 });
-      return async () => {
-        try {
-          if (await readFile(ownerPath, "utf8") !== owner) return;
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-          throw error;
-        }
-        await rm(ownerPath, { force: true });
-        try {
-          await rmdir(lockPath);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT" && (error as NodeJS.ErrnoException).code !== "ENOTEMPTY") throw error;
-        }
+      const heartbeat = setInterval(() => {
+        const beat = new Date();
+        utimes(ownerPath, beat, beat).catch(() => undefined);
+      }, heartbeatMs);
+      heartbeat.unref();
+      return {
+        assertOwned: async () => {
+          if (!await ownedBy(ownerPath, owner)) throw new Error("Lost the credential pool storage lock before writing");
+        },
+        release: async () => {
+          clearInterval(heartbeat);
+          if (!await ownedBy(ownerPath, owner)) return;
+          await rm(ownerPath, { force: true });
+          try {
+            await rmdir(lockPath);
+          } catch (error) {
+            if (!missing(error) && errorCode(error) !== "ENOTEMPTY") throw error;
+          }
+        },
       };
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (created && !missing(error)) throw error;
+      if (!created && errorCode(error) !== "EEXIST") throw error;
     }
 
-    try {
-      if (Date.now() - (await stat(lockPath)).mtimeMs > staleLockMs) {
-        const recovery = randomUUID();
-        try {
-          await writeFile(recoveryPath, recovery, { encoding: "utf8", flag: "wx", mode: 0o600 });
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-          if (Date.now() - (await stat(recoveryPath)).mtimeMs > staleLockMs) await rm(recoveryPath, { force: true });
-          continue;
-        }
-
-        if (await readFile(recoveryPath, "utf8") !== recovery) continue;
-        await rm(ownerPath, { force: true });
-        try {
-          if (await readFile(recoveryPath, "utf8") === recovery) await rm(recoveryPath, { force: true });
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        }
-        try {
-          await rmdir(lockPath);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT" && (error as NodeJS.ErrnoException).code !== "ENOTEMPTY") throw error;
-        }
-        continue;
-      }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    const signal = await lockSignal(lockPath, ownerPath);
+    if (!signal) continue;
+    if (Date.now() - signal.mtimeMs > staleLockMs) {
+      await recoverStaleLock(lockPath, ownerPath, recoveryPath, signal);
+      await sleep(pollMs);
       continue;
     }
-
     if (Date.now() >= deadline) throw new Error("Timed out waiting for credential pool storage lock");
-    await sleep(10);
+    await sleep(pollMs);
   }
 }
 
@@ -98,9 +152,7 @@ export async function writePools(value: StoredPools, path = defaultStorePath()):
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
   await writeFile(temporary, JSON.stringify(value), { mode: 0o600 });
-  await chmod(temporary, 0o600);
   await rename(temporary, path);
-  await chmod(path, 0o600);
 }
 
 export class SerializedPools {
@@ -108,14 +160,15 @@ export class SerializedPools {
 
   mutate(path: string, change: (pools: StoredPools) => void | Promise<void>): Promise<StoredPools> {
     const run = this.#chain.then(async () => {
-      const release = await acquireMutationLock(path);
+      const lock = await acquireMutationLock(path);
       try {
         const pools = await readPools(path);
         await change(pools);
+        await lock.assertOwned();
         await writePools(pools, path);
         return pools;
       } finally {
-        await release();
+        await lock.release();
       }
     });
     this.#chain = run.then(() => undefined, () => undefined);
