@@ -486,6 +486,15 @@ test("rotates on a provider message that says the account cannot pay", async () 
   }
 });
 
+test("still disables a 401 or 403 whose message also says the account cannot pay", async () => {
+  for (const [message, outcome] of [["401 Insufficient Balance", "unauthorized"], ["403 Insufficient account funds", "forbidden"]]) {
+    const pool = new CredentialPool(["one", "two"]);
+    const output = createPooledStream(pool, () => undefined, model, (key) => (key === "one" ? events({ type: "error", error: { errorMessage: message } }) : events({ type: "done", message: { role: "assistant" } })));
+    for await (const _event of output) { /* drain */ }
+    expect(pool.entries()[0]).toMatchObject({ health: "disabled", lastOutcome: outcome });
+  }
+});
+
 test("does not replay after visible output and preserves its provider error", async () => {
   const pool = new CredentialPool(["one", "two"]);
   const attempts: string[] = [];

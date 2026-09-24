@@ -28,10 +28,10 @@ type RoutingActivity = {
 export type CredentialEntry = Omit<Credential, "key"> & RoutingActivity;
 
 export function attemptOutcome(failure: Failure): AttemptOutcome {
-  if (failure.status === 402 || failure.insufficientFunds) return "insufficient-funds";
   if (failure.quota) return "quota";
   if (failure.status === 401) return "unauthorized";
   if (failure.status === 403) return "forbidden";
+  if (failure.status === 402 || failure.insufficientFunds) return "insufficient-funds";
   if (failure.status === 429) return "rate-limited";
   return "error";
 }
