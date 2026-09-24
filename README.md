@@ -38,7 +38,9 @@ Keep the file out of backups or sharing systems that do not meet your credential
 
 For a stable Pi session ID, selection is deterministic.
 Otherwise selection is round-robin across eligible keys.
-Only pre-output 401, 403, 429, and quota failures can rotate a request, Retry-After is honored, and a request is never replayed after text, thinking, or tool output begins.
+Only pre-output 401, 402, 403, 429, quota, and insufficient funds or balance failures can rotate a request, and a request is never replayed after text, thinking, or tool output begins.
+A 401 or 403 disables the key, and a 429 or quota failure cools it for its Retry-After or one minute.
+A 402 or an insufficient funds or balance message cools the key for one hour whatever Retry-After says, because an account that cannot pay recovers only after a top-up or when its monthly window resets; `/credential-pool reset` makes it eligible at once.
 Attempts never exceed pool size.
 Routing activity is in memory only and disappears when Pi exits.
 
