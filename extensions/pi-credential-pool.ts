@@ -17,12 +17,12 @@ type CatalogRef = { current: GoProvider };
 type RestoredModelRef = { models: readonly Model<GoApi>[] };
 
 function statusFrom(message: string): number | undefined {
-	const match = message.match(/\b(401|403|429)\b/);
+	const match = message.match(/\b(401|402|403|429)\b/);
 	return match ? Number(match[1]) : undefined;
 }
 
 function failureFrom(response: StreamMetadata, message = ""): Failure {
-	return { status: response.status ?? statusFrom(message), retryAfterMs: response.retryAfterMs, quota: /quota|rate limit/i.test(message) };
+	return { status: response.status ?? statusFrom(message), retryAfterMs: response.retryAfterMs, quota: /quota|rate limit/i.test(message), insufficientFunds: /insufficient (account )?(funds|balance)/i.test(message) };
 }
 
 function errorEvent(model: Model<Api>, error: unknown): Extract<AssistantMessageEvent, { type: "error" }> {

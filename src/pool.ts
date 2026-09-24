@@ -14,9 +14,9 @@ export type Credential = {
   retryAt?: number;
 };
 
-export type Failure = { status?: number; retryAfterMs?: number; quota?: boolean };
+export type Failure = { status?: number; retryAfterMs?: number; quota?: boolean; insufficientFunds?: boolean };
 
-export type AttemptOutcome = "ok" | "unauthorized" | "forbidden" | "rate-limited" | "quota" | "error";
+export type AttemptOutcome = "ok" | "unauthorized" | "forbidden" | "rate-limited" | "quota" | "insufficient-funds" | "error";
 
 type RoutingActivity = {
   attempts: number;
@@ -28,6 +28,7 @@ type RoutingActivity = {
 export type CredentialEntry = Omit<Credential, "key"> & RoutingActivity;
 
 export function attemptOutcome(failure: Failure): AttemptOutcome {
+  if (failure.status === 402 || failure.insufficientFunds) return "insufficient-funds";
   if (failure.quota) return "quota";
   if (failure.status === 401) return "unauthorized";
   if (failure.status === 403) return "forbidden";
@@ -125,10 +126,11 @@ export class CredentialPool {
       }
       return true;
     }
-    if (failure.status === 429 || failure.quota) {
+    const unpaid = failure.status === 402 || failure.insufficientFunds;
+    if (unpaid || failure.status === 429 || failure.quota) {
       if (target) {
         target.health = "cooling";
-        target.retryAt = now + (failure.retryAfterMs ?? 60_000);
+        target.retryAt = now + (unpaid ? 3_600_000 : failure.retryAfterMs ?? 60_000);
         this.#publish(now);
       }
       return true;

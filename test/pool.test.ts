@@ -808,6 +808,86 @@ test("two sessions over one store share a cooldown", async () => {
 	}
 });
 
+const unpaidBody = JSON.stringify({ error: { type: "server_error", message: "Upstream request failed: Insufficient account funds" } });
+
+function completionSse(): string {
+	const chunk = (delta: { role?: "assistant"; content?: string }, finishReason: "stop" | null) => ({ id: "paid", object: "chat.completion.chunk", created: 0, model: "deepseek-v4-flash", choices: [{ index: 0, delta, finish_reason: finishReason }] });
+	return [chunk({ role: "assistant", content: "ok" }, null), chunk({}, "stop")].map((value) => `data: ${JSON.stringify(value)}\n\n`).join("") + "data: [DONE]\n\n";
+}
+
+async function startSession(session: Awaited<ReturnType<typeof loadExtension>>, sessionId: string): Promise<void> {
+	for (const handler of session.handlers.get("session_start") ?? []) await handler({ type: "session_start" }, { sessionManager: { getSessionId: () => sessionId }, modelRegistry: { getProvider: () => undefined } });
+}
+
+async function unpaidRequest(provider: any, unpaidKey: string) {
+	const deepseek = opencodeGoProvider().getModels().find((entry) => entry.id === "deepseek-v4-flash")!;
+	const used: string[] = [];
+	const output = provider.streamSimple(deepseek, { messages: [{ role: "user", content: "hi" }] }, {
+		fetch: async (_input: string | URL | Request, init?: RequestInit) => {
+			const key = new Headers(init?.headers).get("authorization")!.replace(/^Bearer /, "");
+			used.push(key);
+			return key === unpaidKey
+				? new Response(unpaidBody, { status: 402, headers: { "content-type": "application/json" } })
+				: new Response(completionSse(), { status: 200, headers: { "content-type": "text/event-stream" } });
+		},
+	});
+	const received: { type: string; error?: { errorMessage?: string } }[] = [];
+	for await (const event of output) received.push(event);
+	return { used, received };
+}
+
+test("rotates a request away from a key whose account cannot pay", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-unpaid-"));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	const path = join(home, ".pi", "agent", "credential-pools.json");
+	const [unpaid, paid] = ["unpaid-key", "paid-key"];
+	await writePools({ version: 1, pools: { "opencode-go": [unpaid, paid] } }, path);
+	try {
+		expect(new CredentialPool([unpaid, paid]).select("first-session")?.key).toBe(unpaid);
+		const session = await loadExtension();
+		await startSession(session, "first-session");
+		const { used, received } = await unpaidRequest(session.provider, unpaid);
+		expect(used).toEqual([unpaid, paid]);
+		expect(received.map((event) => event.type)).not.toContain("error");
+		expect(received.at(-1)?.type).toBe("done");
+		expect(await listing(session)).toMatch(new RegExp(`${fingerprint(unpaid)} cooling attempts=1 last-used=\\S+ outcome=insufficient-funds`));
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
+});
+
+test("keeps later requests from other sessions and processes off a key whose account cannot pay", async () => {
+	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-unpaid-later-"));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	const path = join(home, ".pi", "agent", "credential-pools.json");
+	const [unpaid, paid] = ["unpaid-key", "paid-key"];
+	await writePools({ version: 1, pools: { "opencode-go": [unpaid, paid] } }, path);
+	try {
+		expect(new CredentialPool([unpaid, paid]).select("second-session")?.key).toBe(unpaid);
+		const session = await loadExtension();
+		await startSession(session, "first-session");
+		const before = Date.now();
+		await unpaidRequest(session.provider, unpaid);
+		const after = Date.now();
+		await startSession(session, "second-session");
+		expect((await unpaidRequest(session.provider, unpaid)).used).toEqual([paid]);
+
+		const health = await waitForHealth(path, (value) => credentialIdentity(unpaid) in value);
+		expect(health[credentialIdentity(unpaid)]).toEqual({ state: "cooling", retryAt: expect.any(Number) });
+		expect(health[credentialIdentity(unpaid)]!.retryAt).toBeGreaterThanOrEqual(before + 3_600_000);
+		expect(health[credentialIdentity(unpaid)]!.retryAt).toBeLessThanOrEqual(after + 3_600_000);
+		const other = await loadExtension();
+		await startSession(other, "second-session");
+		expect((await unpaidRequest(other.provider, unpaid)).used).toEqual([paid]);
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
+});
+
 test("reset clears the shared health every session sees", async () => {
 	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-reset-"));
 	const previousHome = process.env.HOME;
