@@ -116,6 +116,12 @@ export class CredentialPool {
     return selected;
   }
 
+  nextRetryAt(now = Date.now()): number | undefined {
+    this.#wake(now);
+    const pending = this.#items.flatMap((item) => (item.health === "cooling" && item.retryAt !== undefined ? [item.retryAt] : []));
+    return pending.length ? Math.min(...pending) : undefined;
+  }
+
   fail(item: Credential, failure: Failure, now = Date.now()): boolean {
     const target = this.#items.find((candidate) => candidate.identity === item.identity);
     if (failure.status === 401 || failure.status === 403) {

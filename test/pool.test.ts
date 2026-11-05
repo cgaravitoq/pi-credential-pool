@@ -1334,6 +1334,16 @@ test("holds an account that cannot pay out of every later turn instead of re-adm
 	});
 });
 
+test("waits for the earliest cooldown instead of failing at once when every account is cooling", async () => {
+	const key = "cooling-key";
+	await withStore({ [credentialIdentity(key)]: { state: "cooling", retryAt: Date.now() + 300 } }, [key], async () => {
+		const session = await loadExtension();
+		const { used, received } = await incidentRequest(session.provider, () => paidResponse());
+		expect(used).toEqual([key]);
+		expect(received.at(-1)?.type).toBe("done");
+	});
+});
+
 test("routes to an account whose stored cooldown has already passed", async () => {
 	const key = "expired-key";
 	await withStore({ [credentialIdentity(key)]: { state: "cooling", retryAt: Date.now() - 300_000 } }, [key], async () => {

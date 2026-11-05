@@ -1,4 +1,5 @@
 import { stat } from "node:fs/promises";
+import { setTimeout as sleep } from "node:timers/promises";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type Api, type AssistantMessageEvent, type AssistantMessageEventStream, type Model, type ModelsStoreEntry, type Provider } from "@earendil-works/pi-ai";
 import { builtinProviders, getBuiltinModelDataGeneratedAt } from "@earendil-works/pi-ai/providers/all";
@@ -9,6 +10,7 @@ import { fetchUsage, UsageCache, type FetchLike, type UsageReport } from "../src
 const poolName = "opencode-go";
 const usageConcurrency = 4;
 const usageTimeoutMs = 10_000;
+const coolingWaitMs = 60_000;
 
 export type PoolExtensionDeps = { fetch?: FetchLike; now?: () => number };
 type ProviderStream = (key: string, fetch: typeof globalThis.fetch) => AssistantMessageEventStream;
@@ -29,7 +31,7 @@ function errorEvent(model: Model<Api>, error: unknown): Extract<AssistantMessage
 	return { type: "error", reason: "error", error: { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "error", errorMessage: error instanceof Error ? error.message : "Credential pool failed", timestamp: Date.now() } };
 }
 
-export function createPooledStream(pool: CredentialPool, sessionId: () => string | undefined, model: Model<Api>, stream: ProviderStream, fetcher: FetchLike = globalThis.fetch): AssistantMessageEventStream {
+export function createPooledStream(pool: CredentialPool, sessionId: () => string | undefined, model: Model<Api>, stream: ProviderStream, fetcher: FetchLike = globalThis.fetch, signal?: AbortSignal): AssistantMessageEventStream {
 	const output = createAssistantMessageEventStream();
 	void (async () => {
 		const attempted = new Set<string>();
@@ -37,7 +39,12 @@ export function createPooledStream(pool: CredentialPool, sessionId: () => string
 		while (attempted.size < Math.min(pool.size, 3)) {
 			const at = Date.now();
 			const credential = pool.select(sessionId(), at, attempted);
-			if (!credential) break;
+			if (!credential) {
+				const retryAt = attempted.size ? undefined : pool.nextRetryAt(at);
+				if (retryAt === undefined || retryAt - at > coolingWaitMs) break;
+				await sleep(retryAt - at, undefined, { signal });
+				continue;
+			}
 			attempted.add(credential.identity);
 			pool.markAttempt(credential, at);
 			let forwarded = false;
@@ -176,7 +183,7 @@ export default async function credentialPoolExtension(pi: ExtensionAPI, deps: Po
 			check: async (input) => pool.size ? { type: "api_key", source: "credential-pool" } : builtin.auth.apiKey?.check?.(input),
 			resolve: async (input) => pool.size ? { auth: { apiKey: "" }, source: "credential-pool" } : builtin.auth.apiKey?.resolve(input),
 		} },
-		streamSimple: (model, context, options) => createPooledStream(pool, () => activeSessionId, model, (key, fetch) => builtin.streamSimple(model, context, { ...options, apiKey: key, fetch }), options?.fetch ?? deps.fetch ?? globalThis.fetch),
+		streamSimple: (model, context, options) => createPooledStream(pool, () => activeSessionId, model, (key, fetch) => builtin.streamSimple(model, context, { ...options, apiKey: key, fetch }), options?.fetch ?? deps.fetch ?? globalThis.fetch, options?.signal),
 	};
 	pi.registerProvider(provider);
 	pi.on("session_start", (_event, ctx) => {
