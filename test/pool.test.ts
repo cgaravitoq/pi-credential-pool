@@ -1270,3 +1270,64 @@ test("adopts neither side of a raced remove whose store write failed", async () 
 		else process.env.HOME = previousHome;
 	}
 });
+
+const overloadedBody = JSON.stringify({ error: { type: "server_error", message: "Upstream request failed: [overloaded] the server is overloaded; retry shortly" } });
+
+async function incidentRequest(provider: any, answer: (key: string) => Response) {
+	const deepseek = opencodeGoProvider().getModels().find((entry) => entry.id === "deepseek-v4-flash")!;
+	const used: string[] = [];
+	const output = provider.streamSimple(deepseek, { messages: [{ role: "user", content: "hi" }] }, {
+		fetch: async (_input: string | URL | Request, init?: RequestInit) => {
+			const key = new Headers(init?.headers).get("authorization")!.replace(/^Bearer /, "");
+			used.push(key);
+			return answer(key);
+		},
+	});
+	const received: { type: string; error?: { errorMessage?: string } }[] = [];
+	for await (const event of output) received.push(event);
+	return { used, received };
+}
+
+const unpaidResponse = () => new Response(unpaidBody, { status: 402, headers: { "content-type": "application/json" } });
+const overloadedResponse = () => new Response(overloadedBody, { status: 429, headers: { "content-type": "application/json" } });
+const paidResponse = () => new Response(completionSse(), { status: 200, headers: { "content-type": "text/event-stream" } });
+
+async function withStore(health: HealthRecord, keys: string[], run: (path: string) => Promise<void>): Promise<void> {
+	const home = await mkdtemp(join(tmpdir(), "pi-credential-pool-incident-"));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	const path = join(home, ".pi", "agent", "credential-pools.json");
+	const store: Parameters<typeof writePools>[0] = { version: 1, pools: { "opencode-go": keys } };
+	if (Object.keys(health).length) store.health = health;
+	await writePools(store, path);
+	try {
+		await run(path);
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+	}
+}
+
+test("holds an account that cannot pay out of every later turn instead of re-admitting it", async () => {
+	const [unpaid, healthy] = ["unpaid-key", "healthy-key"];
+	await withStore({}, [unpaid, healthy], async () => {
+		const session = await loadExtension();
+		const answer = (key: string) => (key === unpaid ? unpaidResponse() : paidResponse());
+		const used: string[] = [];
+		for (let turn = 0; turn < 4; turn++) used.push(...(await incidentRequest(session.provider, answer)).used);
+		expect(used.filter((key) => key === unpaid)).toHaveLength(1);
+	});
+});
+
+test("routes to an account whose stored cooldown has already passed", async () => {
+	const key = "expired-key";
+	await withStore({ [credentialIdentity(key)]: { state: "cooling", retryAt: Date.now() - 300_000 } }, [key], async () => {
+		const session = await loadExtension();
+		const { used, received } = await incidentRequest(session.provider, () => paidResponse());
+		expect(used).toEqual([key]);
+		expect(received.at(-1)?.type).toBe("done");
+		const other = await loadExtension();
+		for (const handler of other.handlers.get("turn_start") ?? []) await handler({ type: "turn_start" }, {});
+		expect((await incidentRequest(other.provider, () => paidResponse())).used).toEqual([key]);
+	});
+});
