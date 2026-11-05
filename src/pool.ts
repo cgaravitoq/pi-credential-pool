@@ -14,7 +14,7 @@ export type Credential = {
   retryAt?: number;
 };
 
-export type Failure = { status?: number; retryAfterMs?: number; quota?: boolean; insufficientFunds?: boolean };
+export type Failure = { status?: number; retryAfterMs?: number; quota?: boolean; insufficientFunds?: boolean; overloaded?: boolean };
 
 export type AttemptOutcome = "ok" | "unauthorized" | "forbidden" | "rate-limited" | "quota" | "insufficient-funds" | "error";
 
@@ -126,6 +126,7 @@ export class CredentialPool {
       }
       return true;
     }
+    if (failure.overloaded) return false;
     const unpaid = failure.status === 402 || failure.insufficientFunds;
     if (unpaid || failure.status === 429 || failure.quota) {
       if (target) {

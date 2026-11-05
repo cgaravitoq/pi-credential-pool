@@ -22,7 +22,7 @@ function statusFrom(message: string): number | undefined {
 }
 
 function failureFrom(response: StreamMetadata, message = ""): Failure {
-	return { status: response.status ?? statusFrom(message), retryAfterMs: response.retryAfterMs, quota: /quota|rate limit/i.test(message), insufficientFunds: /insufficient (account )?(funds|balance)/i.test(message) };
+	return { status: response.status ?? statusFrom(message), retryAfterMs: response.retryAfterMs, quota: /quota|rate limit/i.test(message), insufficientFunds: /insufficient (account )?(funds|balance)/i.test(message), overloaded: /\boverloaded\b/i.test(message) };
 }
 
 function errorEvent(model: Model<Api>, error: unknown): Extract<AssistantMessageEvent, { type: "error" }> {

@@ -1308,6 +1308,21 @@ async function withStore(health: HealthRecord, keys: string[], run: (path: strin
 	}
 }
 
+test("a provider-wide 429 overload does not cool the healthy account out of the pool", async () => {
+	const [unpaid, healthy] = ["unpaid-key", "healthy-key"];
+	await withStore({}, [unpaid, healthy], async () => {
+		const session = await loadExtension();
+		let overloads = 1;
+		const answer = (key: string) => (key === unpaid ? unpaidResponse() : overloads-- > 0 ? overloadedResponse() : paidResponse());
+		const first = await incidentRequest(session.provider, answer);
+		expect(first.received.at(-1)?.error?.errorMessage).toContain("overloaded");
+		expect(await listing(session)).toContain(`${fingerprint(healthy)} ready`);
+		const retry = await incidentRequest(session.provider, answer);
+		expect(retry.used).toEqual([healthy]);
+		expect(retry.received.at(-1)?.type).toBe("done");
+	});
+});
+
 test("holds an account that cannot pay out of every later turn instead of re-admitting it", async () => {
 	const [unpaid, healthy] = ["unpaid-key", "healthy-key"];
 	await withStore({}, [unpaid, healthy], async () => {
