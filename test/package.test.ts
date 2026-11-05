@@ -24,7 +24,8 @@ function branchPatterns(source: string): string[] | undefined {
 test("the packed tarball ships every declared runtime file", async () => {
   const packed = await run(["npm", "pack", "--dry-run", "--json"]);
   expect(packed.exitCode, packed.stderr).toBe(0);
-  const [report] = JSON.parse(packed.stdout) as [{ files: { path: string }[] }];
+  const parsed = JSON.parse(packed.stdout) as { files: { path: string }[] }[] | Record<string, { files: { path: string }[] }>;
+  const [report] = Object.values(parsed);
   const paths = report!.files.map((file) => file.path);
   const required = ["extensions/pi-credential-pool.ts", "src/pool.ts", "src/storage.ts", "src/usage.ts", "scripts/live-smoke.ts"];
   expect(required.filter((path) => !paths.includes(path))).toEqual([]);
