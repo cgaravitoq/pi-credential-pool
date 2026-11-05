@@ -1356,3 +1356,30 @@ test("routes to an account whose stored cooldown has already passed", async () =
 		expect((await incidentRequest(other.provider, () => paidResponse())).used).toEqual([key]);
 	});
 });
+
+test("a lone account comes back in the same process once its cooldown passes, with no store write or turn start", async () => {
+	const key = "lone-key";
+	await withStore({}, [key], async (path) => {
+		const session = await loadExtension();
+		const limited = () => new Response(null, { status: 429, headers: { "retry-after": "1" } });
+		await incidentRequest(session.provider, limited);
+		await waitForHealth(path, (value) => credentialIdentity(key) in value);
+		await Bun.sleep(1_100);
+		const { used, received } = await incidentRequest(session.provider, () => paidResponse());
+		expect(used).toEqual([key]);
+		expect(received.at(-1)?.type).toBe("done");
+	});
+});
+
+test("a lone account that the provider answers overloaded is retried by the next request", async () => {
+	const key = "lone-overloaded-key";
+	await withStore({}, [key], async () => {
+		const session = await loadExtension();
+		let overloads = 3;
+		const answer = () => (overloads-- > 0 ? overloadedResponse() : paidResponse());
+		const attempts = [];
+		for (let retry = 0; retry < 4; retry++) attempts.push(await incidentRequest(session.provider, answer));
+		expect(attempts.map(({ used }) => used)).toEqual([[key], [key], [key], [key]]);
+		expect(attempts.at(-1)!.received.at(-1)?.type).toBe("done");
+	});
+});
